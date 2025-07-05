@@ -5,6 +5,7 @@ import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from pathlib import Path
 import os
+from features.rss_ingest import resolve_feed_url
 
 env_path = Path(__file__).resolve().parent / '.env'
 load_dotenv(env_path)
@@ -23,18 +24,27 @@ sp_oauth = SpotifyOAuth(
     scope="user-read-playback-state"
 )
 
-spotify = spotipy.Spotify(auth_manager=sp_oauth)
-# Example: Redesigning Health & Home podcast
-show_id = "41UJ6L0AksZCXNv00jA1jk"
+from features.rss_ingest import resolve_feed_url, download_episodes_from_rss
 
-episodes = spotify.show_episodes(show_id, limit=5)
+apple_url = input("Paste Apple Podcasts URL: ")
+rss_url = resolve_feed_url(apple_url)
 
-for ep in episodes['items']:
-    print("\n🎧 Episode Info:")
-    print("Title:", ep['name'])
-    print("Description:", ep['description'])
-    print("Audio Preview URL:", ep['audio_preview_url'])
-    print("Episode ID:", ep['id'])
+if not rss_url:
+    print("⚠️ Could not resolve RSS feed from the Apple Podcasts URL.")
+    exit()
+
+download_episodes_from_rss(rss_url, limit=3)
+
+
+def transcribe_audio(file_path, client):
+    with open(file_path, "rb") as audio_file:
+       transcript = client.audio.transcriptions.create(
+    model="whisper-1",
+    file=audio_file,
+    response_format="text"
+)
+    return transcript
+
 
 api_key = os.getenv("OPENAI_API_KEY")
 
@@ -51,8 +61,16 @@ system_prompt = (
 )
 user_prompt = f"Title: {title}\nSummary: {summary}\n\nWhat are the best categories for this episode?"
 
+
 # === Call OpenAI using new SDK ===
 client = OpenAI(api_key=api_key)
+# === Test transcription ===
+audio_path = "example.mp3"  # Replace with your own file if needed
+try:
+    transcription = transcribe_audio(audio_path, client)
+    print("\n📝 Transcript:\n", transcription)
+except Exception as e:
+    print("⚠️ Error transcribing audio:", e)
 
 response = client.chat.completions.create(
     model="gpt-3.5-turbo",
@@ -66,3 +84,22 @@ response = client.chat.completions.create(
 # === Output ===
 topic = response.choices[0].message.content.strip()
 print(f"\n🧠 Suggested Topic: {topic}")
+# === Set up OpenAI Whisper client ===
+from openai import OpenAI
+
+api_key = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=api_key)
+
+# === Transcribe all downloaded episodes ===
+from pathlib import Path
+
+downloads_path = Path("downloads")
+mp3_files = list(downloads_path.glob("*.mp3"))
+
+for mp3_file in mp3_files:
+    print(f"\n🔊 Transcribing: {mp3_file.name}")
+    try:
+        transcript = transcribe_audio(mp3_file, client)
+        print(f"📝 Transcript for {mp3_file.name[:50]}...\n{transcript[:300]}...\n")
+    except Exception as e:
+        print(f"⚠️ Failed to transcribe {mp3_file.name}: {e}")
