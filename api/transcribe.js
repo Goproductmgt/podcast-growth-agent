@@ -1,53 +1,140 @@
 // api/transcribe.js - Episode title search + Whisper transcription
 import https from 'https';
 
-// NEW: Smart optimization function to handle long transcripts
-function optimizeForGPT(transcript) {
-  if (!transcript || transcript.length < 8000) {
-    return transcript; // Keep short transcripts as-is
+// Configuration constants - single source of truth
+const CONFIG = {
+  OPTIMIZATION: {
+    TRIGGER_LENGTH: 8000,     // When to start optimizing
+    MAX_RESPONSE_SIZE: 50000, // Conservative limit well under 100KB
+    OPENING_SENTENCES: 15,
+    KEY_INSIGHTS_LIMIT: 25,
+    ENDING_SENTENCES: 10
+  },
+  WHISPER: {
+    MAX_FILE_SIZE: 25 * 1024 * 1024, // 25MB limit
+    MODEL: 'whisper-1',
+    RESPONSE_FORMAT: 'text'
+  }
+};
+
+// High-value content patterns for preserving niche insights
+const VALUE_PATTERNS = [
+  /\b[A-Z][a-z]*\s+[A-Z][a-z]*\b/,                    // Brand names, proper nouns
+  /\$\d+|\d+%|\d+\s*(years?|months?|minutes?)/,       // Numbers, stats, metrics
+  /\b(recommend|suggest|advice|should|try|use)\b/i,   // Recommendations
+  /\b(website|instagram|facebook|twitter|linkedin|tiktok)\b/i, // Social platforms
+  /\b(community|group|forum|subreddit|discord)\b/i,   // Communities
+  /\b(secret|tip|hack|strategy|method|technique)\b/i, // Actionable content
+  /\b(brand|company|product|service|business)\b/i,    // Business mentions
+  /\b(contact|email|phone|address|location)\b/i,      // Contact information
+];
+
+/**
+ * Optimizes transcript for GPT processing while preserving niche insights
+ * @param {string} transcript - Raw transcript from Whisper
+ * @returns {string} Optimized transcript under size limits
+ */
+function optimizeTranscriptForGPT(transcript) {
+  if (!transcript || transcript.length < CONFIG.OPTIMIZATION.TRIGGER_LENGTH) {
+    return transcript;
   }
   
-  // Split into sentences for better processing
-  const sentences = transcript.split(/\.\s+/);
+  const sentences = transcript.split(/\.\s+/).filter(s => s.trim().length > 0);
   
-  // Keep opening context (first 15 sentences)
-  const opening = sentences.slice(0, 15).join('. ');
+  // Extract key sections while preserving context
+  const opening = extractSection(sentences, 0, CONFIG.OPTIMIZATION.OPENING_SENTENCES);
+  const insights = extractValueSentences(sentences, VALUE_PATTERNS, CONFIG.OPTIMIZATION.KEY_INSIGHTS_LIMIT);
+  const ending = extractSection(sentences, -CONFIG.OPTIMIZATION.ENDING_SENTENCES);
   
-  // Find high-value sentences with specific content
-  const valueIndicators = [
-    /\b[A-Z][a-z]*\s+[A-Z][a-z]*\b/, // Brand names, proper nouns
-    /\$\d+|\d+%|\d+\s*(years?|months?|minutes?)/, // Numbers, stats
-    /\b(recommend|suggest|advice|should|try|use)\b/i, // Recommendations
-    /\b(website|instagram|facebook|twitter|linkedin)\b/i, // Social platforms
-    /\b(community|group|forum|subreddit)\b/i, // Communities
-    /\b(secret|tip|hack|strategy|method)\b/i, // Actionable content
-  ];
+  const optimizedContent = buildOptimizedTranscript(opening, insights, ending, sentences.length);
   
-  // Extract high-value sentences
-  const keyInsights = sentences.filter(sentence => 
-    valueIndicators.some(pattern => pattern.test(sentence))
-  ).slice(0, 25);
+  // Validate size constraint
+  if (optimizedContent.length > CONFIG.OPTIMIZATION.MAX_RESPONSE_SIZE) {
+    console.warn(`Transcript still too large (${optimizedContent.length} chars), applying additional compression`);
+    return applyAdditionalCompression(opening, insights, ending, sentences.length);
+  }
   
-  // Keep ending context (last 10 sentences)
-  const ending = sentences.slice(-10).join('. ');
-  
-  // Combine with clear structure
+  return optimizedContent;
+}
+
+/**
+ * Extracts a section of sentences
+ */
+function extractSection(sentences, start, count = null) {
+  if (typeof start === 'number' && start < 0) {
+    return sentences.slice(start).join('. ');
+  }
+  return sentences.slice(start, count).join('. ');
+}
+
+/**
+ * Filters sentences containing high-value content patterns
+ */
+function extractValueSentences(sentences, patterns, limit) {
+  return sentences
+    .filter(sentence => patterns.some(pattern => pattern.test(sentence)))
+    .slice(0, limit);
+}
+
+/**
+ * Builds the structured optimized transcript
+ */
+function buildOptimizedTranscript(opening, insights, ending, totalSentences) {
   return [
     "=== EPISODE OPENING ===",
     opening,
     "",
     "=== KEY INSIGHTS & RECOMMENDATIONS ===", 
-    keyInsights.join('. '),
+    insights.join('. '),
     "",
     "=== EPISODE CONCLUSION ===",
     ending,
     "",
-    `[Analyzed ${sentences.length} sentences for comprehensive insights]`
+    `[Analyzed ${totalSentences} sentences for comprehensive insights]`
   ].join('\n');
 }
 
+/**
+ * Applies additional compression when standard optimization isn't enough
+ */
+function applyAdditionalCompression(opening, insights, ending, totalSentences) {
+  const compressedOpening = opening.substring(0, 1000);
+  const compressedInsights = insights.slice(0, 15).join('. ').substring(0, 2000);
+  const compressedEnding = ending.substring(0, 800);
+  
+  return [
+    "=== EPISODE HIGHLIGHTS ===",
+    compressedOpening,
+    "",
+    "=== TOP INSIGHTS ===",
+    compressedInsights,
+    "",
+    "=== CONCLUSION ===", 
+    compressedEnding,
+    "",
+    `[Compressed analysis of ${totalSentences} sentences]`
+  ].join('\n');
+}
+
+/**
+ * Extracts episode title from Apple Podcasts URL
+ */
+function extractSearchTerm(url) {
+  const episodeMatch = url.match(/\/podcast\/([^\/]+)\/id\d+/);
+  if (episodeMatch) {
+    return episodeMatch[1]
+      .replace(/-/g, ' ')
+      .replace(/\b\w/g, l => l.toUpperCase());
+  }
+  
+  return 'episode';
+}
+
+/**
+ * Main API handler
+ */
 export default async function handler(req, res) {
-  // Enable CORS
+  // CORS configuration
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -58,13 +145,14 @@ export default async function handler(req, res) {
 
   if (req.method === 'GET') {
     return res.status(200).json({ 
-      message: 'Podcast Growth Agent API v10 - Optimized Response Processing',
+      message: 'Podcast Growth Agent API v11 - Production Optimized',
       status: 'ready',
       features: [
         'Search for SPECIFIC EPISODE by title',
         'Real Whisper transcription',
-        'Smart response optimization for all episode lengths',
-        'Preserves niche insights and recommendations',
+        'Production-grade response optimization',
+        'Guaranteed reliability for all episode lengths',
+        'Preserves maximum niche insights',
         'Ready for growth recommendations'
       ]
     });
@@ -72,19 +160,16 @@ export default async function handler(req, res) {
 
   if (req.method === 'POST') {
     try {
-      const { url } = req.body || {};
+      const { url } = req.body;
       
       if (!url) {
         return res.status(400).json({ error: 'Podcast URL is required' });
       }
 
-      // Extract episode title from URL for search
       const searchTerm = extractSearchTerm(url);
-      
-      // Search for the specific episode by title
       const searchResults = await searchListenNotes(searchTerm);
       
-      if (!searchResults.results || searchResults.results.length === 0) {
+      if (!searchResults.results?.length) {
         return res.status(404).json({ 
           error: 'No episodes found for this episode title',
           search_term: searchTerm,
@@ -92,10 +177,8 @@ export default async function handler(req, res) {
         });
       }
 
-      // Use the first (most relevant) result
       const episode = searchResults.results[0];
       
-      // Check if we have a valid audio URL
       if (!episode.audio) {
         return res.status(400).json({ 
           error: 'No audio file available for transcription',
@@ -103,9 +186,9 @@ export default async function handler(req, res) {
         });
       }
 
-      // Transcribe the audio using Whisper
+      // Transcribe with error handling
       let transcript;
-      let transcription_source = 'whisper';
+      let transcriptionSource = 'whisper';
       
       try {
         console.log('Starting Whisper transcription for:', episode.title_original);
@@ -113,22 +196,22 @@ export default async function handler(req, res) {
         console.log('Whisper transcription completed successfully');
       } catch (transcriptionError) {
         console.error('Whisper transcription failed:', transcriptionError.message);
-        // Fallback to description-based content
         transcript = `Transcription not available. Episode about: ${episode.description_original || episode.title_original}`;
-        transcription_source = 'fallback_description';
+        transcriptionSource = 'fallback_description';
       }
       
+      // Return optimized response
       return res.status(200).json({
         status: 'success',
         title: episode.title_original,
         description: episode.description_original,
-        transcript: optimizeForGPT(transcript), // CHANGED: Now using optimized transcript
+        transcript: optimizeTranscriptForGPT(transcript),
         keywords: extractKeywordsFromText((transcript || '') + ' ' + episode.title_original),
         duration: episode.audio_length_sec,
         audio_url: episode.audio,
         podcast_title: episode.podcast?.title_original || 'Unknown Podcast',
         source: 'ListenNotes + Whisper',
-        transcription_source: transcription_source,
+        transcription_source: transcriptionSource,
         listennotes_id: episode.id,
         received_url: url,
         search_term: searchTerm,
@@ -147,36 +230,17 @@ export default async function handler(req, res) {
   return res.status(405).json({ error: 'Method not allowed' });
 }
 
-function extractSearchTerm(url) {
-  // Extract the full episode title from the Apple Podcasts URL
-  // Format: /podcast/full-episode-title-here/id123456?i=episode_id
-  
-  const episodeMatch = url.match(/\/podcast\/([^\/]+)\/id\d+/);
-  if (episodeMatch) {
-    // Convert URL slug to readable episode title
-    return episodeMatch[1]
-      .replace(/-/g, ' ')
-      .replace(/\b\w/g, l => l.toUpperCase()); // Title case
-  }
-  
-  // Fallback patterns for known URLs
-  if (url.includes('easy-breezy-eats-simple-summer-recipes')) {
-    return 'Easy Breezy Eats Simple Summer Recipes To Keep You Cool';
-  }
-  if (url.includes('pressed-for-greatness-the-olive-oil-episode')) {
-    return 'Pressed For Greatness The Olive Oil Episode';
-  }
-  
-  return 'episode';
-}
-
+/**
+ * Search ListenNotes for episode
+ */
 async function searchListenNotes(query) {
   const apiKey = process.env.LISTENNOTES_API_KEY;
-  
-  // Search for the specific EPISODE by title
   return searchEpisodeByTitle(query, apiKey);
 }
 
+/**
+ * Execute ListenNotes API search
+ */
 async function searchEpisodeByTitle(query, apiKey) {
   return new Promise((resolve, reject) => {
     const searchQuery = encodeURIComponent(query);
@@ -184,40 +248,35 @@ async function searchEpisodeByTitle(query, apiKey) {
       hostname: 'listen-api.listennotes.com',
       path: `/api/v2/search?q=${searchQuery}&type=episode&only_in=title&language=English&len_min=5`,
       method: 'GET',
-      headers: {
-        'X-ListenAPI-Key': apiKey
-      }
+      headers: { 'X-ListenAPI-Key': apiKey }
     };
 
     const req = https.request(options, (res) => {
       let data = '';
       
-      res.on('data', (chunk) => {
-        data += chunk;
-      });
-      
+      res.on('data', (chunk) => { data += chunk; });
       res.on('end', () => {
         try {
           const parsed = JSON.parse(data);
           if (res.statusCode === 200) {
             resolve(parsed);
           } else {
-            reject(new Error(`ListenNotes episode search error: ${parsed.error || 'Unknown error'}`));
+            reject(new Error(`ListenNotes search error: ${parsed.error || 'Unknown error'}`));
           }
         } catch (e) {
-          reject(new Error('Failed to parse ListenNotes episode search response'));
+          reject(new Error('Failed to parse ListenNotes response'));
         }
       });
     });
 
-    req.on('error', (error) => {
-      reject(error);
-    });
-
+    req.on('error', reject);
     req.end();
   });
 }
 
+/**
+ * Transcribe audio using OpenAI Whisper
+ */
 async function transcribeWithWhisper(audioUrl) {
   const openaiApiKey = process.env.OPENAI_API_KEY;
   
@@ -226,35 +285,31 @@ async function transcribeWithWhisper(audioUrl) {
   }
 
   try {
-    // Fetch the audio file
     console.log('Fetching audio file from:', audioUrl);
     const audioResponse = await fetch(audioUrl);
+    
     if (!audioResponse.ok) {
       throw new Error(`Failed to fetch audio: ${audioResponse.status} ${audioResponse.statusText}`);
     }
     
-    // Check file size (Whisper has a 25MB limit)
     const contentLength = audioResponse.headers.get('content-length');
-    if (contentLength && parseInt(contentLength) > 25 * 1024 * 1024) {
+    if (contentLength && parseInt(contentLength) > CONFIG.WHISPER.MAX_FILE_SIZE) {
       throw new Error('Audio file too large for Whisper (>25MB)');
     }
     
     const audioBuffer = await audioResponse.arrayBuffer();
     console.log('Audio file fetched, size:', audioBuffer.byteLength, 'bytes');
     
-    // Create FormData for Whisper API
     const formData = new FormData();
     const audioBlob = new Blob([audioBuffer], { type: 'audio/mpeg' });
     formData.append('file', audioBlob, 'episode.mp3');
-    formData.append('model', 'whisper-1');
-    formData.append('response_format', 'text');
+    formData.append('model', CONFIG.WHISPER.MODEL);
+    formData.append('response_format', CONFIG.WHISPER.RESPONSE_FORMAT);
 
     console.log('Sending to Whisper API...');
     const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${openaiApiKey}`,
-      },
+      headers: { 'Authorization': `Bearer ${openaiApiKey}` },
       body: formData
     });
 
@@ -273,9 +328,12 @@ async function transcribeWithWhisper(audioUrl) {
   }
 }
 
+/**
+ * Extract keywords from text using frequency analysis
+ */
 function extractKeywordsFromText(text) {
   const words = text.toLowerCase()
-    .replace(/<[^>]*>/g, '') // Remove HTML tags
+    .replace(/<[^>]*>/g, '')
     .split(/\s+/);
   
   const stopWords = new Set([
