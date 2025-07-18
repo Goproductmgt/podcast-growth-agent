@@ -1,6 +1,51 @@
 // api/transcribe.js - Episode title search + Whisper transcription
 import https from 'https';
 
+// NEW: Smart optimization function to handle long transcripts
+function optimizeForGPT(transcript) {
+  if (!transcript || transcript.length < 8000) {
+    return transcript; // Keep short transcripts as-is
+  }
+  
+  // Split into sentences for better processing
+  const sentences = transcript.split(/\.\s+/);
+  
+  // Keep opening context (first 15 sentences)
+  const opening = sentences.slice(0, 15).join('. ');
+  
+  // Find high-value sentences with specific content
+  const valueIndicators = [
+    /\b[A-Z][a-z]*\s+[A-Z][a-z]*\b/, // Brand names, proper nouns
+    /\$\d+|\d+%|\d+\s*(years?|months?|minutes?)/, // Numbers, stats
+    /\b(recommend|suggest|advice|should|try|use)\b/i, // Recommendations
+    /\b(website|instagram|facebook|twitter|linkedin)\b/i, // Social platforms
+    /\b(community|group|forum|subreddit)\b/i, // Communities
+    /\b(secret|tip|hack|strategy|method)\b/i, // Actionable content
+  ];
+  
+  // Extract high-value sentences
+  const keyInsights = sentences.filter(sentence => 
+    valueIndicators.some(pattern => pattern.test(sentence))
+  ).slice(0, 25);
+  
+  // Keep ending context (last 10 sentences)
+  const ending = sentences.slice(-10).join('. ');
+  
+  // Combine with clear structure
+  return [
+    "=== EPISODE OPENING ===",
+    opening,
+    "",
+    "=== KEY INSIGHTS & RECOMMENDATIONS ===", 
+    keyInsights.join('. '),
+    "",
+    "=== EPISODE CONCLUSION ===",
+    ending,
+    "",
+    `[Analyzed ${sentences.length} sentences for comprehensive insights]`
+  ].join('\n');
+}
+
 export default async function handler(req, res) {
   // Enable CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -13,12 +58,13 @@ export default async function handler(req, res) {
 
   if (req.method === 'GET') {
     return res.status(200).json({ 
-      message: 'Podcast Growth Agent API v9 - Full Whisper Integration',
+      message: 'Podcast Growth Agent API v10 - Optimized Response Processing',
       status: 'ready',
       features: [
         'Search for SPECIFIC EPISODE by title',
         'Real Whisper transcription',
-        'Fallback to description if transcription fails',
+        'Smart response optimization for all episode lengths',
+        'Preserves niche insights and recommendations',
         'Ready for growth recommendations'
       ]
     });
@@ -76,7 +122,7 @@ export default async function handler(req, res) {
         status: 'success',
         title: episode.title_original,
         description: episode.description_original,
-        transcript: transcript,
+        transcript: optimizeForGPT(transcript), // CHANGED: Now using optimized transcript
         keywords: extractKeywordsFromText((transcript || '') + ' ' + episode.title_original),
         duration: episode.audio_length_sec,
         audio_url: episode.audio,
