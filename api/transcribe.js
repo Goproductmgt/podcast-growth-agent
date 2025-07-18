@@ -1,4 +1,4 @@
-// api/transcribe.js - Episode title search strategy
+// api/transcribe.js - Episode title search + Whisper transcription
 import https from 'https';
 
 export default async function handler(req, res) {
@@ -13,13 +13,13 @@ export default async function handler(req, res) {
 
   if (req.method === 'GET') {
     return res.status(200).json({ 
-      message: 'Podcast Growth Agent API v8 - Episode Title Search',
+      message: 'Podcast Growth Agent API v9 - Full Whisper Integration',
       status: 'ready',
       features: [
         'Search for SPECIFIC EPISODE by title',
-        'Extract full episode title from URL', 
-        'Direct episode matching',
-        'Precise episode content for recommendations'
+        'Real Whisper transcription',
+        'Fallback to description if transcription fails',
+        'Ready for growth recommendations'
       ]
     });
   }
@@ -49,31 +49,50 @@ export default async function handler(req, res) {
       // Use the first (most relevant) result
       const episode = searchResults.results[0];
       
+      // Check if we have a valid audio URL
+      if (!episode.audio) {
+        return res.status(400).json({ 
+          error: 'No audio file available for transcription',
+          episode_title: episode.title_original 
+        });
+      }
+
+      // Transcribe the audio using Whisper
+      let transcript;
+      let transcription_source = 'whisper';
+      
+      try {
+        console.log('Starting Whisper transcription for:', episode.title_original);
+        transcript = await transcribeWithWhisper(episode.audio);
+        console.log('Whisper transcription completed successfully');
+      } catch (transcriptionError) {
+        console.error('Whisper transcription failed:', transcriptionError.message);
+        // Fallback to description-based content
+        transcript = `Transcription not available. Episode about: ${episode.description_original || episode.title_original}`;
+        transcription_source = 'fallback_description';
+      }
+      
       return res.status(200).json({
         status: 'success',
         title: episode.title_original,
         description: episode.description_original,
-        transcript: `Real transcript coming soon! This episode "${episode.title_original}" is about: ${episode.description_original.substring(0, 200)}...`,
-        keywords: extractKeywordsFromText(episode.title_original + ' ' + episode.description_original),
+        transcript: transcript,
+        keywords: extractKeywordsFromText((transcript || '') + ' ' + episode.title_original),
         duration: episode.audio_length_sec,
         audio_url: episode.audio,
         podcast_title: episode.podcast?.title_original || 'Unknown Podcast',
-        source: 'ListenNotes Episode Title Search',
+        source: 'ListenNotes + Whisper',
+        transcription_source: transcription_source,
         listennotes_id: episode.id,
         received_url: url,
         search_term: searchTerm,
-        search_strategy: 'episode_title_search',
-        debug_info: {
-          found_podcast_title: episode.podcast?.title_original,
-          searched_for: searchTerm,
-          apple_url_pattern: url.includes('pressed-for-greatness') ? 'contains pressed-for-greatness' : 'does not contain pressed-for-greatness'
-        }
+        search_strategy: 'episode_title_search'
       });
 
     } catch (error) {
       console.error('API Error:', error);
       return res.status(500).json({ 
-        error: 'Failed to search episode data',
+        error: 'Failed to process episode',
         details: error.message 
       });
     }
@@ -151,6 +170,61 @@ async function searchEpisodeByTitle(query, apiKey) {
 
     req.end();
   });
+}
+
+async function transcribeWithWhisper(audioUrl) {
+  const openaiApiKey = process.env.OPENAI_API_KEY;
+  
+  if (!openaiApiKey) {
+    throw new Error('OpenAI API key not configured');
+  }
+
+  try {
+    // Fetch the audio file
+    console.log('Fetching audio file from:', audioUrl);
+    const audioResponse = await fetch(audioUrl);
+    if (!audioResponse.ok) {
+      throw new Error(`Failed to fetch audio: ${audioResponse.status} ${audioResponse.statusText}`);
+    }
+    
+    // Check file size (Whisper has a 25MB limit)
+    const contentLength = audioResponse.headers.get('content-length');
+    if (contentLength && parseInt(contentLength) > 25 * 1024 * 1024) {
+      throw new Error('Audio file too large for Whisper (>25MB)');
+    }
+    
+    const audioBuffer = await audioResponse.arrayBuffer();
+    console.log('Audio file fetched, size:', audioBuffer.byteLength, 'bytes');
+    
+    // Create FormData for Whisper API
+    const formData = new FormData();
+    const audioBlob = new Blob([audioBuffer], { type: 'audio/mpeg' });
+    formData.append('file', audioBlob, 'episode.mp3');
+    formData.append('model', 'whisper-1');
+    formData.append('response_format', 'text');
+
+    console.log('Sending to Whisper API...');
+    const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${openaiApiKey}`,
+      },
+      body: formData
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Whisper API error: ${response.status} ${errorText}`);
+    }
+
+    const transcript = await response.text();
+    console.log('Transcript received, length:', transcript.length, 'characters');
+    return transcript;
+
+  } catch (error) {
+    console.error('Whisper transcription error:', error);
+    throw error;
+  }
 }
 
 function extractKeywordsFromText(text) {
