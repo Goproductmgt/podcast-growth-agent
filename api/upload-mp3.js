@@ -745,10 +745,19 @@ function formatErrorResponse(error, processingTime) {
  */
 export default async function handler(req, res) {
   // CORS configuration
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization');
-  
+  // More comprehensive CORS headers for all request types
+const origin = req.headers.origin;
+res.setHeader('Access-Control-Allow-Origin', origin || '*');
+res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control');
+res.setHeader('Access-Control-Allow-Credentials', 'false');
+res.setHeader('Access-Control-Max-Age', '86400');
+
+// Handle preflight requests for large files
+if (req.method === 'OPTIONS') {
+  res.status(200).end();
+  return;
+}
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
   }
