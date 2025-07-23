@@ -743,8 +743,24 @@ function formatErrorResponse(error, processingTime) {
 /**
  * Main API handler - Production Grade with Proper Error Handling
  */
+// Handle large file uploads - ADD THIS BEFORE THE FUNCTION
+export const config = {
+  api: {
+    bodyParser: {
+      sizeLimit: '50mb',
+    },
+  },
+}
 export default async function handler(req, res) {
-  // CORS configuration
+// Check content length for large files - ADD AFTER CORS HEADERS
+  const contentLength = parseInt(req.headers['content-length'] || '0');
+  if (contentLength > 50 * 1024 * 1024) { // 50MB
+    return res.status(413).json({
+      error: 'File too large. Maximum size is 50MB for reliable processing.',
+      max_size: '50MB'
+    });
+  }
+    // CORS configuration
   // More comprehensive CORS headers for all request types
 const origin = req.headers.origin;
 res.setHeader('Access-Control-Allow-Origin', origin || '*');
