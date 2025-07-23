@@ -1,5 +1,10 @@
 {
   "name": "podcast-growth-agent-api",
   "version": "1.0.0",
-  "type": "module"
+  "type": "module",
+  "dependencies": {
+    "form-data": "^4.0.4",
+    "formidable": "^3.5.4",
+    "node-fetch": "^3.3.2"
+  }
 }
