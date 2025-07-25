@@ -1,11 +1,8 @@
 {
   "functions": {
     "api/upload-mp3.js": {
-      "maxDuration": 300,
+      "maxDuration": 60,
       "memory": 1024
     }
-  },
-  "limits": {
-    "duration": 300
   }
 }
