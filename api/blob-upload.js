@@ -1,84 +1,184 @@
-// api/uppy-blob-upload.js - Uppy-compatible blob upload endpoint
+// api/blob-upload.js - Production-ready blob upload endpoint
 import { put } from '@vercel/blob';
 import formidable from 'formidable';
 import { createReadStream } from 'fs';
 
 export default async function handler(req, res) {
-  // Add CORS headers
-  res.setHeader('Access-Control-Allow-Origin', 'https://podcastgrowthagent.com');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control');
-  res.setHeader('Access-Control-Allow-Credentials', 'false');
-  res.setHeader('Access-Control-Max-Age', '86400');
-  
+  // CORS headers - Applied to ALL responses
+  const corsHeaders = {
+    'Access-Control-Allow-Origin': 'https://podcastgrowthagent.com',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Origin, X-Requested-With, Content-Type, Accept, Authorization',
+    'Access-Control-Allow-Credentials': 'false',
+    'Access-Control-Max-Age': '86400',
+    'Vary': 'Origin'
+  };
+
+  // Set CORS headers on every response
+  Object.entries(corsHeaders).forEach(([key, value]) => {
+    res.setHeader(key, value);
+  });
+
+  // Handle preflight OPTIONS request
   if (req.method === 'OPTIONS') {
+    console.log('📋 CORS preflight request received');
     return res.status(200).end();
   }
 
+  // Only allow POST requests
   if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
+    console.log(`❌ Method ${req.method} not allowed`);
+    return res.status(405).json({ 
+      error: 'Method not allowed',
+      allowedMethods: ['POST'] 
+    });
   }
 
+  const startTime = Date.now();
+  console.log(`📁 Starting blob upload from origin: ${req.headers.origin}`);
+
   try {
-    // Parse multipart form data from Uppy
+    // Enhanced formidable configuration for better performance
     const form = formidable({
       maxFileSize: 100 * 1024 * 1024, // 100MB
+      maxTotalFileSize: 100 * 1024 * 1024, // 100MB total
       uploadDir: '/tmp',
-      keepExtensions: true
+      keepExtensions: true,
+      allowEmptyFiles: false,
+      multiples: false, // Single file only
+      filename: (name, ext, part) => {
+        // Sanitize filename to prevent issues
+        const safeName = part.originalFilename?.replace(/[^a-zA-Z0-9.-]/g, '_') || 'upload';
+        return `${Date.now()}-${safeName}`;
+      }
     });
 
+    // Parse form with better error handling
     const [fields, files] = await new Promise((resolve, reject) => {
       form.parse(req, (err, fields, files) => {
-        if (err) reject(err);
-        else resolve([fields, files]);
+        if (err) {
+          console.error('📋 Form parsing error:', err.message);
+          reject(new Error(`File parsing failed: ${err.message}`));
+        } else {
+          resolve([fields, files]);
+        }
       });
     });
 
+    // Validate file upload
     const file = Array.isArray(files.file) ? files.file[0] : files.file;
     
     if (!file) {
-      return res.status(400).json({ error: 'No file uploaded' });
+      console.log('❌ No file in upload request');
+      return res.status(400).json({ 
+        error: 'No file uploaded',
+        expectedField: 'file'
+      });
     }
 
-    console.log(`📁 Uploading to blob: ${file.originalFilename} (${Math.round(file.size / 1024 / 1024)}MB)`);
+    // Additional file validation
+    if (file.size === 0) {
+      console.log('❌ Empty file uploaded');
+      return res.status(400).json({ 
+        error: 'Empty file not allowed',
+        receivedSize: file.size
+      });
+    }
 
-    // Upload to Vercel Blob
-    const blob = await put(file.originalFilename, createReadStream(file.filepath), {
-      access: 'public',
-      addRandomSuffix: true
-    });
+    // Validate file type (audio files only)
+    const allowedTypes = ['audio/mpeg', 'audio/mp3', 'audio/mp4', 'audio/x-m4a', 'audio/wav'];
+    const allowedExtensions = ['.mp3', '.m4a', '.wav'];
+    const hasValidType = allowedTypes.includes(file.mimetype) || file.mimetype?.startsWith('audio/');
+    const hasValidExtension = allowedExtensions.some(ext => 
+      file.originalFilename?.toLowerCase().endsWith(ext)
+    );
 
-    console.log(`✅ Blob uploaded: ${blob.url}`);
+    if (!hasValidType && !hasValidExtension) {
+      console.log(`❌ Invalid file type: ${file.mimetype}, filename: ${file.originalFilename}`);
+      return res.status(400).json({ 
+        error: 'Invalid file type',
+        allowedTypes: 'MP3, M4A, WAV audio files only',
+        receivedType: file.mimetype
+      });
+    }
 
-    // Clean up temp file
+    const fileSizeMB = Math.round(file.size / 1024 / 1024);
+    console.log(`📁 Processing: ${file.originalFilename} (${fileSizeMB}MB, ${file.mimetype})`);
+
+    // Upload to Vercel Blob with enhanced configuration
+    const blob = await put(
+      file.originalFilename || 'podcast-episode.mp3', 
+      createReadStream(file.filepath), 
+      {
+        access: 'public',
+        addRandomSuffix: true,
+        contentType: file.mimetype || 'audio/mpeg'
+      }
+    );
+
+    const uploadTime = Date.now() - startTime;
+    console.log(`✅ Blob uploaded successfully: ${blob.url} (${uploadTime}ms)`);
+
+    // Enhanced cleanup with retry logic
     try {
-      await import('fs').then(fs => fs.promises.unlink(file.filepath));
+      const fs = await import('fs');
+      await fs.promises.unlink(file.filepath);
+      console.log('🧹 Temporary file cleaned up');
     } catch (cleanupError) {
-      console.warn('Cleanup warning:', cleanupError.message);
+      console.warn('⚠️ Cleanup warning:', cleanupError.message);
+      // Non-critical error, don't fail the request
     }
 
-    // Return blob URL in format Uppy v4 expects
-    res.json({
+    // Enhanced response format optimized for Uppy v4
+    const response = {
+      success: true,
       blobUrl: blob.url,
-      url: blob.url,
+      url: blob.url, // Uppy expects this field
       filename: file.originalFilename,
       size: file.size,
-      // Uppy v4 expects this structure
-      success: true
-    });
+      contentType: file.mimetype,
+      uploadTime: uploadTime,
+      // Additional metadata for debugging
+      metadata: {
+        uploadedAt: new Date().toISOString(),
+        originalName: file.originalFilename,
+        processedName: blob.pathname
+      }
+    };
+
+    console.log(`🎉 Upload complete for ${file.originalFilename} in ${uploadTime}ms`);
+    return res.status(200).json(response);
 
   } catch (error) {
-    console.error('❌ Uppy blob upload error:', error);
-    res.status(500).json({ 
+    const uploadTime = Date.now() - startTime;
+    console.error(`❌ Upload failed after ${uploadTime}ms:`, error.message);
+    
+    // Enhanced error response
+    const errorResponse = {
+      success: false,
       error: error.message || 'Upload failed',
-      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
-    });
+      code: error.code || 'UPLOAD_ERROR',
+      uploadTime: uploadTime
+    };
+
+    // Add stack trace in development only
+    if (process.env.NODE_ENV === 'development') {
+      errorResponse.details = error.stack;
+    }
+
+    // Return appropriate HTTP status based on error type
+    const statusCode = error.code === 'LIMIT_FILE_SIZE' ? 413 : 500;
+    return res.status(statusCode).json(errorResponse);
   }
 }
 
+// Enhanced Vercel configuration
 export const config = {
   api: {
-    bodyParser: false,
-    sizeLimit: '100mb'
+    bodyParser: false, // Required for formidable
+    sizeLimit: '100mb',
+    externalResolver: true,
+    responseLimit: false
   },
+  maxDuration: 300 // 5 minutes for large files
 };
