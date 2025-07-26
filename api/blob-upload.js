@@ -57,12 +57,14 @@ export default async function handler(req, res) {
       console.warn('Cleanup warning:', cleanupError.message);
     }
 
-    // Return blob URL in format Uppy expects
+    // Return blob URL in format Uppy v4 expects
     res.json({
       blobUrl: blob.url,
       url: blob.url,
       filename: file.originalFilename,
-      size: file.size
+      size: file.size,
+      // Uppy v4 expects this structure
+      success: true
     });
 
   } catch (error) {
