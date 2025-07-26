@@ -1,36 +1,37 @@
-// api/blob-upload.js - Production-ready blob upload endpoint
+// api/blob-upload.js - Production-ready blob upload endpoint with CORS fixed
 import { put } from '@vercel/blob';
 import formidable from 'formidable';
 import { createReadStream } from 'fs';
 
 export default async function handler(req, res) {
-  // CORS headers - Applied to ALL responses
+  // CORS headers - Applied to ALL responses (CRITICAL FOR UPPY.JS)
   const corsHeaders = {
     'Access-Control-Allow-Origin': 'https://podcastgrowthagent.com',
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Origin, X-Requested-With, Content-Type, Accept, Authorization',
+    'Access-Control-Allow-Headers': 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control',
     'Access-Control-Allow-Credentials': 'false',
     'Access-Control-Max-Age': '86400',
     'Vary': 'Origin'
   };
 
-  // Set CORS headers on every response
+  // Set CORS headers on EVERY response (this is what was missing!)
   Object.entries(corsHeaders).forEach(([key, value]) => {
     res.setHeader(key, value);
   });
 
-  // Handle preflight OPTIONS request
+  // Handle preflight OPTIONS request (CRITICAL for CORS)
   if (req.method === 'OPTIONS') {
-    console.log('📋 CORS preflight request received');
+    console.log('🚀 CORS preflight request received and handled');
     return res.status(200).end();
   }
 
-  // Only allow POST requests
+  // Only allow POST requests for actual uploads
   if (req.method !== 'POST') {
     console.log(`❌ Method ${req.method} not allowed`);
     return res.status(405).json({ 
+      success: false,
       error: 'Method not allowed',
-      allowedMethods: ['POST'] 
+      allowedMethods: ['POST', 'OPTIONS'] 
     });
   }
 
@@ -71,6 +72,7 @@ export default async function handler(req, res) {
     if (!file) {
       console.log('❌ No file in upload request');
       return res.status(400).json({ 
+        success: false,
         error: 'No file uploaded',
         expectedField: 'file'
       });
@@ -80,6 +82,7 @@ export default async function handler(req, res) {
     if (file.size === 0) {
       console.log('❌ Empty file uploaded');
       return res.status(400).json({ 
+        success: false,
         error: 'Empty file not allowed',
         receivedSize: file.size
       });
@@ -87,7 +90,7 @@ export default async function handler(req, res) {
 
     // Validate file type (audio files only)
     const allowedTypes = ['audio/mpeg', 'audio/mp3', 'audio/mp4', 'audio/x-m4a', 'audio/wav'];
-    const allowedExtensions = ['.mp3', '.m4a', '.wav'];
+    const allowedExtensions = ['.mp3', '.m4a', '.wav', '.mp4'];
     const hasValidType = allowedTypes.includes(file.mimetype) || file.mimetype?.startsWith('audio/');
     const hasValidExtension = allowedExtensions.some(ext => 
       file.originalFilename?.toLowerCase().endsWith(ext)
@@ -96,8 +99,9 @@ export default async function handler(req, res) {
     if (!hasValidType && !hasValidExtension) {
       console.log(`❌ Invalid file type: ${file.mimetype}, filename: ${file.originalFilename}`);
       return res.status(400).json({ 
+        success: false,
         error: 'Invalid file type',
-        allowedTypes: 'MP3, M4A, WAV audio files only',
+        allowedTypes: 'MP3, M4A, WAV, MP4 audio files only',
         receivedType: file.mimetype
       });
     }
@@ -129,7 +133,7 @@ export default async function handler(req, res) {
       // Non-critical error, don't fail the request
     }
 
-    // Enhanced response format optimized for Uppy v4
+    // Enhanced response format optimized for Uppy v4 with CORS headers already set
     const response = {
       success: true,
       blobUrl: blob.url,
@@ -153,7 +157,7 @@ export default async function handler(req, res) {
     const uploadTime = Date.now() - startTime;
     console.error(`❌ Upload failed after ${uploadTime}ms:`, error.message);
     
-    // Enhanced error response
+    // Enhanced error response with CORS headers already set
     const errorResponse = {
       success: false,
       error: error.message || 'Upload failed',

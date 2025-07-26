@@ -3,6 +3,66 @@
     "api/upload-mp3.js": {
       "maxDuration": 60,
       "memory": 1024
+    },
+    "api/blob-upload.js": {
+      "maxDuration": 300,
+      "memory": 1024
+    },
+    "api/analyze-from-blob.js": {
+      "maxDuration": 300,
+      "memory": 1024
     }
-  }
+  },
+  "headers": [
+    {
+      "source": "/api/blob-upload",
+      "headers": [
+        {
+          "key": "Access-Control-Allow-Origin",
+          "value": "https://podcastgrowthagent.com"
+        },
+        {
+          "key": "Access-Control-Allow-Methods",
+          "value": "POST, OPTIONS"
+        },
+        {
+          "key": "Access-Control-Allow-Headers",
+          "value": "Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control"
+        },
+        {
+          "key": "Access-Control-Allow-Credentials",
+          "value": "false"
+        },
+        {
+          "key": "Access-Control-Max-Age",
+          "value": "86400"
+        },
+        {
+          "key": "Vary",
+          "value": "Origin"
+        }
+      ]
+    },
+    {
+      "source": "/api/analyze-from-blob",
+      "headers": [
+        {
+          "key": "Access-Control-Allow-Origin",
+          "value": "https://podcastgrowthagent.com"
+        },
+        {
+          "key": "Access-Control-Allow-Methods",
+          "value": "POST, OPTIONS"
+        },
+        {
+          "key": "Access-Control-Allow-Headers",
+          "value": "Origin, X-Requested-With, Content-Type, Accept, Authorization"
+        },
+        {
+          "key": "Access-Control-Allow-Credentials",
+          "value": "false"
+        }
+      ]
+    }
+  ]
 }
