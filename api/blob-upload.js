@@ -2,6 +2,17 @@
 import { handleUpload } from '@vercel/blob/client';
 
 export default async function handler(req, res) {
+  // FIXED: Add CORS headers for WordPress domain
+  res.setHeader('Access-Control-Allow-Origin', 'https://podcastgrowthagent.com');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control');
+  res.setHeader('Access-Control-Allow-Credentials', 'false');
+  res.setHeader('Access-Control-Max-Age', '86400');
+  
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
