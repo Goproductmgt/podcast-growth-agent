@@ -2,6 +2,11 @@
   "name": "podcast-growth-agent-api",
   "version": "1.0.0",
   "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
   "dependencies": {
     "@vercel/blob": "^1.1.1",
     "form-data": "^4.0.4",
@@ -10,10 +15,5 @@
     "node-fetch": "^3.3.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
-  },
-  "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start"
-  }
-}
+  } 
+} 
