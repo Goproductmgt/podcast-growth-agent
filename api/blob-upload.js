@@ -2,27 +2,15 @@
 import { put } from '@vercel/blob';
 import formidable from 'formidable';
 import { createReadStream } from 'fs';
+import { setCorsHeaders, handleCorsPrelight } from '../lib/cors.js';
 
 export default async function handler(req, res) {
-  // CORS headers - Applied to ALL responses (CRITICAL FOR UPPY.JS)
-  const corsHeaders = {
-    'Access-Control-Allow-Origin': 'https://podcastgrowthagent.com',
-    'Access-Control-Allow-Methods': 'POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control',
-    'Access-Control-Allow-Credentials': 'false',
-    'Access-Control-Max-Age': '86400',
-    'Vary': 'Origin'
-  };
-
-  // Set CORS headers on EVERY response (this is what was missing!)
-  Object.entries(corsHeaders).forEach(([key, value]) => {
-    res.setHeader(key, value);
-  });
-
+  // Set CORS headers on EVERY response (CRITICAL FOR UPPY.JS)
+  setCorsHeaders(res, req.headers.origin);
+  
   // Handle preflight OPTIONS request (CRITICAL for CORS)
-  if (req.method === 'OPTIONS') {
-    console.log('🚀 CORS preflight request received and handled');
-    return res.status(200).end();
+  if (handleCorsPrelight(req, res)) {
+    return; // Preflight handled, exit early
   }
 
   // Only allow POST requests for actual uploads
