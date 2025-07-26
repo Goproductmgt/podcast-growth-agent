@@ -15,15 +15,15 @@
   },
   "headers": [
     {
-      "source": "/api/blob-upload",
+      "source": "/api/(.*)",
       "headers": [
         {
           "key": "Access-Control-Allow-Origin",
-          "value": "https://podcastgrowthagent.com"
+          "value": "*"
         },
         {
           "key": "Access-Control-Allow-Methods",
-          "value": "POST, OPTIONS"
+          "value": "GET, POST, PUT, DELETE, OPTIONS"
         },
         {
           "key": "Access-Control-Allow-Headers",
@@ -36,31 +36,6 @@
         {
           "key": "Access-Control-Max-Age",
           "value": "86400"
-        },
-        {
-          "key": "Vary",
-          "value": "Origin"
-        }
-      ]
-    },
-    {
-      "source": "/api/analyze-from-blob",
-      "headers": [
-        {
-          "key": "Access-Control-Allow-Origin",
-          "value": "https://podcastgrowthagent.com"
-        },
-        {
-          "key": "Access-Control-Allow-Methods",
-          "value": "POST, OPTIONS"
-        },
-        {
-          "key": "Access-Control-Allow-Headers",
-          "value": "Origin, X-Requested-With, Content-Type, Accept, Authorization"
-        },
-        {
-          "key": "Access-Control-Allow-Credentials",
-          "value": "false"
         }
       ]
     }
