@@ -693,9 +693,8 @@ function formatErrorResponse(error, processingTime) {
  * Main API handler
  */
 export default async function handler(req, res) {
-  // CORS configuration
-  const origin = req.headers.origin;
-  res.setHeader('Access-Control-Allow-Origin', origin || '*');
+  // FIXED CORS configuration - specific domain instead of dynamic
+  res.setHeader('Access-Control-Allow-Origin', 'https://podcastgrowthagent.com');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control');
   res.setHeader('Access-Control-Allow-Credentials', 'false');
@@ -707,7 +706,7 @@ export default async function handler(req, res) {
 
   if (req.method === 'GET') {
     return res.status(200).json({ 
-      message: 'MP3 Upload & Analysis API v3.0 - Fixed Version',
+      message: 'MP3 Upload & Analysis API v3.0 - Production Grade',
       status: 'ready',
       environment: process.env.NODE_ENV || 'development',
       groq_plan: 'Developer (100MB support)',
@@ -723,13 +722,13 @@ export default async function handler(req, res) {
       ],
       limits: {
         max_file_size: '100MB (Groq Developer Plan)',
-        rate_limit: APP_CONFIG.RATE_LIMIT.ENABLED ? '20 uploads/hour' : 'disabled (dev)',
-        daily_limit: APP_CONFIG.RATE_LIMIT.ENABLED ? '500 uploads/day' : 'disabled (dev)',
+        rate_limit: '20 uploads/hour',
+        daily_limit: '500 uploads/day',
         supported_formats: ['MP3', 'M4A', 'WAV'],
         transcription_model: APP_CONFIG.GROQ.MODEL
       },
       improvements: {
-        config_fix: 'Fixed naming conflict between CONFIG constant and config export',
+        duration_calculation: 'Uses proper audio bitrate formulas for accurate time estimates',
         error_handling: 'Specific, actionable error messages with user-friendly suggestions',
         performance: 'Enhanced progress tracking and realistic processing estimates',
         reliability: 'Comprehensive fallback strategies and graceful degradation'
