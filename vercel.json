@@ -6,8 +6,7 @@
     },
     "api/blob-upload.js": {
       "maxDuration": 300,
-      "memory": 1024,
-      "maxRequestBodySize": "100mb"
+      "memory": 1024
     },
     "api/analyze-from-blob.js": {
       "maxDuration": 300,
