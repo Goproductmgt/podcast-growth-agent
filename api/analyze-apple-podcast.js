@@ -46,47 +46,88 @@ export default async function handler(req, res) {
       throw new Error(`Failed to get episode metadata: ${metadataResponse.status} - ${errorText}`);
     }
 
-    // Handle streaming JSON response (multiple JSON objects)
+    // Handle streaming JSON response more robustly
     const metadataText = await metadataResponse.text();
-    console.log('Raw metadata response length:', metadataText.length);
+    console.log('Raw metadata response (first 300 chars):', metadataText.substring(0, 300));
 
-    // Parse the streaming response - look for the final success JSON
     let metadata = null;
-    const jsonObjects = metadataText.split('\n').filter(line => line.trim());
     
-    for (const jsonLine of jsonObjects) {
+    // Method 1: Try to find the last complete JSON object with audio_url
+    const jsonPattern = /\{[^{}]*"status":"success"[^{}]*"audio_url"[^{}]*\}/g;
+    const matches = metadataText.match(jsonPattern);
+    
+    if (matches && matches.length > 0) {
       try {
-        const parsed = JSON.parse(jsonLine);
-        if (parsed.status === 'success' && parsed.audio_url) {
-          metadata = parsed;
-          break;
-        }
+        // Use the last match (most complete response)
+        const lastMatch = matches[matches.length - 1];
+        console.log('Found success JSON pattern:', lastMatch.substring(0, 100));
+        metadata = JSON.parse(lastMatch);
       } catch (parseError) {
-        // Skip malformed lines
-        continue;
+        console.log('Pattern matching failed, trying line split method...');
       }
     }
 
+    // Method 2: Split by } and look for complete objects
     if (!metadata) {
-      // Try parsing as single JSON if streaming didn't work
-      try {
-        metadata = JSON.parse(metadataText);
-      } catch (parseError) {
-        console.error('Could not parse any valid JSON from response:', metadataText.substring(0, 500));
-        throw new Error('Invalid response format from metadata API');
+      const parts = metadataText.split('}{');
+      
+      for (let i = 0; i < parts.length; i++) {
+        let jsonStr = parts[i];
+        
+        // Add missing braces
+        if (i > 0) jsonStr = '{' + jsonStr;
+        if (i < parts.length - 1) jsonStr = jsonStr + '}';
+        
+        try {
+          const parsed = JSON.parse(jsonStr);
+          if (parsed.status === 'success' && parsed.audio_url) {
+            metadata = parsed;
+            console.log('Found metadata via split method');
+            break;
+          }
+        } catch (parseError) {
+          continue;
+        }
       }
     }
 
-    // Check for audio_url (your service returns this field)
-    if (!metadata.audio_url) {
-      console.error('No audio_url in metadata:', metadata);
+    // Method 3: Extract just the final JSON manually
+    if (!metadata) {
+      const lastBraceIndex = metadataText.lastIndexOf('}');
+      if (lastBraceIndex > -1) {
+        // Find the opening brace for the last JSON object
+        let braceCount = 0;
+        let startIndex = lastBraceIndex;
+        
+        for (let i = lastBraceIndex; i >= 0; i--) {
+          if (metadataText[i] === '}') braceCount++;
+          if (metadataText[i] === '{') braceCount--;
+          if (braceCount === 0) {
+            startIndex = i;
+            break;
+          }
+        }
+        
+        try {
+          const finalJson = metadataText.substring(startIndex, lastBraceIndex + 1);
+          console.log('Extracted final JSON:', finalJson.substring(0, 100));
+          metadata = JSON.parse(finalJson);
+        } catch (parseError) {
+          console.error('Final JSON extraction failed:', parseError);
+        }
+      }
+    }
+
+    if (!metadata || !metadata.audio_url) {
+      console.error('Could not extract valid metadata with audio_url');
+      console.error('Raw response:', metadataText);
       return res.status(400).json({ 
-        error: 'Could not extract audio URL from episode',
-        metadata: metadata
+        error: 'Could not extract audio URL from episode metadata',
+        rawResponse: metadataText.substring(0, 500)
       });
     }
 
-    console.log('Found audio URL:', metadata.audio_url);
+    console.log('Successfully parsed metadata. Audio URL:', metadata.audio_url);
 
     // Step 3: Download audio file and upload to your Vercel Blob storage
     console.log('Downloading audio file...');
