@@ -30,7 +30,7 @@ export default async function handler(req, res) {
 
     console.log('Extracted episode ID:', episodeId);
 
-    // Step 2: Get audio URL using simple regex (avoid JSON parsing issues)
+    // Step 2: Get audio URL using robust regex extraction
     console.log('Getting episode metadata...');
     const metadataResponse = await fetch('https://podcast-api-amber.vercel.app/api/transcribe', {
       method: 'POST',
@@ -43,21 +43,32 @@ export default async function handler(req, res) {
     }
 
     const responseText = await metadataResponse.text();
-    console.log('Got metadata response, extracting audio URL...');
+    console.log('Raw response length:', responseText.length);
+    console.log('Response preview:', responseText.substring(0, 200));
 
-    // Extract audio URL using regex (avoids JSON parsing issues)
-    const audioUrlMatch = responseText.match(/"audio_url":"([^"]+)"/);
-    const titleMatch = responseText.match(/"title":"([^"]+)"/);
+    // Find the LAST occurrence of audio_url (from the success response)
+    const audioUrlMatches = responseText.match(/"audio_url":"([^"]+)"/g);
+    const titleMatches = responseText.match(/"title":"([^"]+)"/g);
     
-    if (!audioUrlMatch) {
+    if (!audioUrlMatches || audioUrlMatches.length === 0) {
       console.error('No audio URL found in response');
+      console.error('Full response:', responseText);
       return res.status(400).json({ 
-        error: 'Could not extract audio URL from episode' 
+        error: 'Could not extract audio URL from episode',
+        responsePreview: responseText.substring(0, 500)
       });
     }
 
-    const audioUrl = audioUrlMatch[1];
-    const episodeTitle = titleMatch ? titleMatch[1] : (title || 'Apple Podcast Episode');
+    // Use the last audio_url match (from the final success response)
+    const lastAudioUrlMatch = audioUrlMatches[audioUrlMatches.length - 1];
+    const audioUrl = lastAudioUrlMatch.match(/"audio_url":"([^"]+)"/)[1];
+    
+    // Use the last title match if available
+    let episodeTitle = title || 'Apple Podcast Episode';
+    if (titleMatches && titleMatches.length > 0) {
+      const lastTitleMatch = titleMatches[titleMatches.length - 1];
+      episodeTitle = lastTitleMatch.match(/"title":"([^"]+)"/)[1];
+    }
     
     console.log('Found audio URL:', audioUrl);
     console.log('Episode title:', episodeTitle);
