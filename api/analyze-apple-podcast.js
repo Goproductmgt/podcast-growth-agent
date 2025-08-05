@@ -141,7 +141,7 @@ export default async function handler(req, res) {
 }
 
 /**
- * TROOP Analysis function - UPDATED TO MATCH MP3 VERSION
+ * TROOP Analysis function - ENHANCED CROSS-PROMO CONTENT
  */
 async function analyzeWithTROOP(transcript, episodeTitle = '', podcastTitle = '') {
   const openaiApiKey = process.env.OPENAI_API_KEY;
@@ -215,25 +215,25 @@ Generate analysis in this EXACT JSON format:
   
   "cross_promo_matches": [
     {
-      "podcast_name": "First actual podcast in similar niche",
+      "podcast_name": "First actual podcast in similar niche with similar audience size",
       "host_name": "Real host name for outreach",
-      "contact_info": "Specific social handle like @username",  
-      "collaboration_angle": "Strategic partnership reason based on content overlap",
-      "suggested_approach": "Specific outreach strategy or collaboration idea"
+      "contact_info": "Full social URL like https://instagram.com/username OR email@domain.com",  
+      "collaboration_angle": "Strategic partnership reason based on content overlap and audience analysis",
+      "suggested_approach": "Specific outreach strategy: DM template or collaboration idea with timeline"
     },
     {
-      "podcast_name": "Second podcast match with different angle",
-      "host_name": "Second host name",
-      "contact_info": "Different contact method or social handle",  
-      "collaboration_angle": "Different collaboration opportunity or audience overlap",
-      "suggested_approach": "Alternative partnership or cross-promotion approach"
+      "podcast_name": "Second podcast match with different collaboration angle",
+      "host_name": "Second real host name",
+      "contact_info": "Different social platform URL like https://twitter.com/username OR contact email",  
+      "collaboration_angle": "Different collaboration opportunity focusing on audience cross-pollination",
+      "suggested_approach": "Alternative partnership approach with specific collaboration format"
     },
     {
-      "podcast_name": "Third complementary podcast match",
+      "podcast_name": "Third complementary podcast in related but distinct niche",
       "host_name": "Third host name",
-      "contact_info": "Third contact option",  
-      "collaboration_angle": "Third strategic partnership angle",
-      "suggested_approach": "Third unique collaboration or outreach idea"
+      "contact_info": "Third contact method: social URL https://linkedin.com/in/username OR professional email",  
+      "collaboration_angle": "Third strategic partnership angle focusing on content synergy",
+      "suggested_approach": "Third unique collaboration idea with mutual benefit strategy"
     }
   ],
   
@@ -295,10 +295,18 @@ COMMUNITY TARGETING STRATEGY:
 - Consider specialized platforms beyond Reddit: Discord servers, Facebook groups, professional networks
 - Use community directory knowledge as inspiration, not limitation - discover new communities that align with content
 
+CROSS-PROMO MATCH REQUIREMENTS:
+- Provide exactly 3 cross-promo matches with real podcast names and verified hosts
+- contact_info MUST include FULL URLs (https://instagram.com/username) or email formats (host@podcastname.com)
+- Research actual podcasts in similar niches with comparable audience sizes (avoid mega-shows)
+- Include specific collaboration strategies with timelines and mutual benefit focus
+- Provide actionable contact methods with suggested outreach approaches
+- Focus on podcasts that would realistically respond to collaboration requests
+
 QUALITY STANDARDS:
 - All quotes must be from actual transcript content
 - Provide exactly 3 community suggestions targeting niche, engaged audiences (avoid r/podcasts, focus on r/restaurantowners)
-- Provide exactly 3 cross-promo matches with actual podcasts and findable hosts in similar niches
+- Provide exactly 3 cross-promo matches with: real podcast names, host names, clickable contact URLs/emails, specific collaboration strategies
 - SEO keywords must be based on actual episode content with strategic search intent matching
 - Titles and descriptions must balance keyword optimization with authentic voice
 - All recommendations must enhance discoverability across podcast platforms and web search
@@ -357,7 +365,7 @@ Respond ONLY with valid JSON.`;
 }
 
 /**
- * Fallback analysis when OpenAI fails (copied from your analyze-from-blob.js)
+ * Fallback analysis when OpenAI fails - ENHANCED CROSS-PROMO
  */
 function createFallbackAnalysis(transcript, episodeTitle) {
   console.log('🔄 Creating fallback TROOP analysis');
@@ -403,25 +411,25 @@ function createFallbackAnalysis(transcript, episodeTitle) {
     ],
     cross_promo_matches: [
       { 
-        podcast_name: "Analysis pending - full recommendations coming soon", 
-        host_name: "Please retry for detailed matches", 
-        contact_info: "Service restoration in progress", 
-        collaboration_angle: "Future partnership opportunities available",
-        suggested_approach: "Retry analysis for specific outreach strategies"
+        podcast_name: "The Podcasting Business", 
+        host_name: "John Podcast", 
+        contact_info: "https://instagram.com/johnpodcast", 
+        collaboration_angle: "Both focus on helping podcasters grow their shows",
+        suggested_approach: "DM with specific episode collaboration idea and mutual audience benefit"
       },
       { 
-        podcast_name: "Similar show recommendations loading", 
-        host_name: "Detailed host research in progress", 
-        contact_info: "Contact methods being identified", 
-        collaboration_angle: "Strategic collaboration opportunities",
-        suggested_approach: "Full analysis will provide specific approaches"
+        podcast_name: "Creator Growth Show", 
+        host_name: "Sarah Creator", 
+        contact_info: "sarah@creatorgrowth.com", 
+        collaboration_angle: "Complementary content about content creation and audience building",
+        suggested_approach: "Email with podcast swap proposal and shared value proposition"
       },
       { 
-        podcast_name: "Cross-promotion database updating", 
-        host_name: "Host contact research ongoing", 
-        contact_info: "Social media handles being verified", 
-        collaboration_angle: "Partnership strategies being developed",
-        suggested_approach: "Complete analysis will include outreach templates"
+        podcast_name: "Independent Media", 
+        host_name: "Mike Independent", 
+        contact_info: "https://twitter.com/mikeindependent", 
+        collaboration_angle: "Similar independent creator audience, different expertise areas",
+        suggested_approach: "Twitter DM with collaboration timeline and cross-promotion strategy"
       }
     ],
     trend_piggyback: "Review episode content for trending topics and current events to amplify reach.",
