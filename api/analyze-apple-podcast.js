@@ -28,6 +28,8 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'Invalid Apple Podcast URL format' });
     }
 
+    console.log('Extracted episode ID:', episodeId);
+
     // Step 2: Get episode metadata from your existing API
     console.log('Getting episode metadata...');
     const metadataResponse = await fetch('https://podcast-api-amber.vercel.app/api/transcribe', {
@@ -36,24 +38,62 @@ export default async function handler(req, res) {
       body: JSON.stringify({ url: appleUrl })
     });
 
+    console.log('Metadata response status:', metadataResponse.status);
+
     if (!metadataResponse.ok) {
-      throw new Error('Failed to get episode metadata');
+      const errorText = await metadataResponse.text();
+      console.error('Metadata API error:', errorText);
+      throw new Error(`Failed to get episode metadata: ${metadataResponse.status} - ${errorText}`);
     }
 
-    const metadata = await metadataResponse.json();
+    // Handle streaming JSON response (multiple JSON objects)
+    const metadataText = await metadataResponse.text();
+    console.log('Raw metadata response length:', metadataText.length);
+
+    // Parse the streaming response - look for the final success JSON
+    let metadata = null;
+    const jsonObjects = metadataText.split('\n').filter(line => line.trim());
     
-    if (!metadata.audioUrl) {
-      return res.status(400).json({ error: 'Could not extract audio URL from episode' });
+    for (const jsonLine of jsonObjects) {
+      try {
+        const parsed = JSON.parse(jsonLine);
+        if (parsed.status === 'success' && parsed.audio_url) {
+          metadata = parsed;
+          break;
+        }
+      } catch (parseError) {
+        // Skip malformed lines
+        continue;
+      }
     }
 
-    console.log('Found audio URL:', metadata.audioUrl);
+    if (!metadata) {
+      // Try parsing as single JSON if streaming didn't work
+      try {
+        metadata = JSON.parse(metadataText);
+      } catch (parseError) {
+        console.error('Could not parse any valid JSON from response:', metadataText.substring(0, 500));
+        throw new Error('Invalid response format from metadata API');
+      }
+    }
+
+    // Check for audio_url (your service returns this field)
+    if (!metadata.audio_url) {
+      console.error('No audio_url in metadata:', metadata);
+      return res.status(400).json({ 
+        error: 'Could not extract audio URL from episode',
+        metadata: metadata
+      });
+    }
+
+    console.log('Found audio URL:', metadata.audio_url);
 
     // Step 3: Download audio file and upload to your Vercel Blob storage
     console.log('Downloading audio file...');
-    const audioResponse = await fetch(metadata.audioUrl);
+    const audioResponse = await fetch(metadata.audio_url);
     
     if (!audioResponse.ok) {
-      throw new Error('Failed to download audio file');
+      throw new Error(`Failed to download audio file: ${audioResponse.status} - ${audioResponse.statusText}`);
     }
 
     // Get file info
@@ -76,7 +116,8 @@ export default async function handler(req, res) {
 
     // Step 4: Route to your existing analyze-from-blob.js API
     console.log('Starting TROOP analysis...');
-    const analysisResponse = await fetch(`${req.headers.origin || 'https://podcast-growth-agent.vercel.app'}/api/analyze-from-blob`, {
+    const baseUrl = req.headers.origin || 'https://podcast-growth-agent.vercel.app';
+    const analysisResponse = await fetch(`${baseUrl}/api/analyze-from-blob`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -88,7 +129,8 @@ export default async function handler(req, res) {
 
     if (!analysisResponse.ok) {
       const errorText = await analysisResponse.text();
-      throw new Error(`Analysis failed: ${errorText}`);
+      console.error('Analysis API error:', errorText);
+      throw new Error(`Analysis failed: ${analysisResponse.status} - ${errorText}`);
     }
 
     const analysisResult = await analysisResponse.json();
@@ -103,7 +145,8 @@ export default async function handler(req, res) {
         title: metadata.title,
         duration: metadata.duration,
         publishDate: metadata.publishDate,
-        originalUrl: appleUrl
+        originalUrl: appleUrl,
+        podcastTitle: metadata.podcast_title
       },
       analysis: analysisResult
     });
@@ -112,7 +155,7 @@ export default async function handler(req, res) {
     console.error('Apple Podcast analysis error:', error);
     return res.status(500).json({ 
       error: 'Analysis failed', 
-      details: error.message 
+      details: error.message
     });
   }
 }
