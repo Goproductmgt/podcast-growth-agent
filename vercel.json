@@ -11,6 +11,14 @@
     "api/analyze-from-blob.js": {
       "maxDuration": 300,
       "memory": 1024
+    },
+    "api/analyze-apple-podcast.js": {
+      "maxDuration": 300,
+      "memory": 1024
+    },
+    "api/get-upload-url.js": {
+      "maxDuration": 60,
+      "memory": 512
     }
   }
 }
