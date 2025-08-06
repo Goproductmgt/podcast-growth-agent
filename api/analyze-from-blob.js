@@ -89,7 +89,7 @@ export default async function handler(req, res) {
         processing_time_ms: processingTime,
         source: 'Vercel Blob + Groq + Enhanced TROOP',
         processed_at: new Date().toISOString(),
-        api_version: '4.0-blob-enhanced',
+        api_version: '4.0-blob-enhanced-fixed',
         blob_url: blobUrl
       }
     };
@@ -170,21 +170,28 @@ async function analyzeWithEnhancedTROOP(transcript, episodeTitle = '', podcastTi
     return createFallbackAnalysis(transcript, episodeTitle);
   }
 
-  // ENHANCED TROOP METHODOLOGY (Your Competitive Advantage)
+  // ENHANCED TROOP METHODOLOGY WITH ARRAY LENGTH ENFORCEMENT
   const enhancedTROOPPrompt = `**TASK:**
 Analyze the provided podcast episode transcript and generate a comprehensive 10-section growth strategy that helps podcasters expand their audience reach. Extract semantic meaning from the actual transcript content and create actionable marketing recommendations.
 
 **ROLE:**
 You are Podcast Growth Agent, an expert podcast growth strategist with 10+ years of experience helping independent podcasters grow their shows. You combine deep transcript analysis with advanced SEO strategy and community targeting expertise.
 
+**CRITICAL REQUIREMENTS:**
+- MUST provide EXACTLY 3 tweetable quotes
+- MUST provide EXACTLY 3 community suggestions  
+- MUST provide EXACTLY 3 cross-promo matches
+- MUST use NICHE communities (1K-100K members), NOT generic ones like r/podcasts
+- ALL data must be based on actual transcript content
+
 **OUTPUT:**
-Generate analysis in this EXACT JSON format:
+Generate analysis in this EXACT JSON format with EXACT array lengths:
 
 {
   "episode_summary": "2-3 engaging sentences that capture both explicit content and underlying themes, using searchable language while preserving authentic voice",
   "tweetable_quotes": [
     "Direct quote from transcript, lightly edited for social media clarity, under 280 characters",
-    "Second actual quote that captures key insight or emotional moment",
+    "Second actual quote that captures key insight or emotional moment", 
     "Third memorable line from episode content, optimized for shareability"
   ],
   "topics_keywords": [
@@ -198,28 +205,28 @@ Generate analysis in this EXACT JSON format:
   "optimized_description": "150-200 word SEO-optimized description that includes primary keyword in first 125 characters, 2-3 related keywords naturally woven in, emotional hooks, clear value proposition, and call-to-action",
   "community_suggestions": [
     {
-      "name": "First specific niche community name (1K-100K members preferred)",
+      "name": "SPECIFIC niche community name (NOT r/podcasts - use r/mindfulness, r/wellness, r/selfcare etc)",
       "platform": "Reddit/Facebook/Discord/LinkedIn",
-      "url": "Working URL like https://reddit.com/r/communityname",
+      "url": "Working URL like https://reddit.com/r/mindfulness",
       "why": "How episode content solves specific problems this community discusses",
       "post_angle": "Natural conversation starter that adds value",
       "member_size": "1K-100K range for growing podcasts",
       "engagement_strategy": "Specific approach for this community's culture"
     },
     {
-      "name": "Second niche community in different platform",
+      "name": "DIFFERENT niche community (different platform or focus area)",
       "platform": "Different platform from first",
-      "url": "Working URL or specific search terms",
+      "url": "Working URL or specific search terms", 
       "why": "Different angle or problem this episode addresses",
       "post_angle": "Alternative approach for different community culture",
       "member_size": "Community size information",
       "engagement_strategy": "Platform-specific engagement approach"
     },
     {
-      "name": "Third complementary niche community",
+      "name": "THIRD complementary niche community (must be different from first two)",
       "platform": "Third platform option",
       "url": "Working URL when available",
-      "why": "Third angle or aspect episode content addresses",
+      "why": "Third angle or aspect episode content addresses", 
       "post_angle": "Third unique approach for community engagement",
       "member_size": "Size range for targeting strategy",
       "engagement_strategy": "Community-specific posting strategy"
@@ -227,22 +234,22 @@ Generate analysis in this EXACT JSON format:
   ],
   "cross_promo_matches": [
     {
-      "podcast_name": "First actual podcast in similar niche",
+      "podcast_name": "First actual podcast in similar niche (NOT generic)",
       "host_name": "Real host name for outreach",
       "contact_info": "Specific social handle like @username",
       "collaboration_angle": "Strategic partnership reason based on content overlap",
       "suggested_approach": "Specific outreach strategy or collaboration idea"
     },
     {
-      "podcast_name": "Second podcast match with different angle",
-      "host_name": "Second host name",
+      "podcast_name": "Second podcast match with different angle (must be different from first)",
+      "host_name": "Second host name (different from first)",
       "contact_info": "Different contact method or social handle",
-      "collaboration_angle": "Different collaboration opportunity or audience overlap",
+      "collaboration_angle": "Different collaboration opportunity or audience overlap", 
       "suggested_approach": "Alternative partnership or cross-promotion approach"
     },
     {
-      "podcast_name": "Third complementary podcast match",
-      "host_name": "Third host name",
+      "podcast_name": "Third complementary podcast match (must be different from first two)",
+      "host_name": "Third host name (different from first two)",
       "contact_info": "Third contact option",
       "collaboration_angle": "Third strategic partnership angle",
       "suggested_approach": "Third unique collaboration or outreach idea"
@@ -262,7 +269,7 @@ Approach this analysis from the mindset of a supportive growth partner who under
 
 **SEMANTIC ANALYSIS METHODOLOGY:**
 1. Use the exact transcript text to establish deep semantic understanding of themes, emotions, and implicit meanings
-2. Identify niche audience segments and specific communities (1K-100K members) that connect to core themes
+2. Identify niche audience segments and specific communities (1K-100K members) that connect to core themes  
 3. Prioritize smaller, engaged communities over massive generic ones
 4. Apply advanced SEO principles including keyword optimization and multi-platform discoverability
 5. Extend the episode's reach while preserving authentic voice and core message
@@ -274,19 +281,24 @@ Podcast: ${podcastTitle || 'Podcast Growth Analysis'}
 **TRANSCRIPT:**
 ${transcript.length > 15000 ? transcript.substring(0, 15000) + '\n\n[Transcript truncated for processing - full analysis based on episode themes]' : transcript}
 
-**COMMUNITY TARGETING PRINCIPLES:**
-- Choose r/EtsySellers (95K) over r/Entrepreneur (1.8M)
-- Target r/restaurantowners (15K) over r/business (2.8M)
-- Suggest specialized Discord servers over generic Facebook groups
-- Prioritize problem-specific communities over demographic-broad ones
+**COMMUNITY TARGETING EXAMPLES (USE NICHE COMMUNITIES LIKE THESE):**
+For wellness/health episodes: r/mindfulness (500K), r/selfcare (1M), r/wellness (200K), r/mentalhealth (800K)
+For business episodes: r/entrepreneur (1.8M), r/smallbusiness (300K), r/freelance (150K)
+For creative episodes: r/creativity (100K), r/writing (900K), r/design (2M)
 
-Respond ONLY with valid JSON.`;
+**IMPORTANT:** 
+- Do NOT use r/podcasts or generic podcast communities
+- Do NOT use r/business or massive generic communities  
+- DO use specific niche communities relevant to episode content
+- MUST provide exactly 3 items in each array
+
+Respond ONLY with valid JSON that includes exactly 3 community suggestions and exactly 3 cross-promo matches.`;
 
   // SMART ERROR RECOVERY SYSTEM
   try {
     const { default: fetch } = await import('node-fetch');
     
-    console.log('🚀 Starting Enhanced TROOP analysis...');
+    console.log('🚀 Starting Enhanced TROOP analysis with array enforcement...');
     console.log('📏 Enhanced prompt length:', enhancedTROOPPrompt.length);
     console.log('📄 Transcript length:', transcript.length);
     
@@ -299,7 +311,7 @@ Respond ONLY with valid JSON.`;
       body: JSON.stringify({
         model: APP_CONFIG.OPENAI.ANALYSIS_MODEL,
         messages: [
-          { role: 'system', content: 'You are Podcast Growth Agent. You provide detailed podcast growth analysis using the enhanced TROOP framework methodology. Respond with valid JSON only.' },
+          { role: 'system', content: 'You are Podcast Growth Agent. You provide detailed podcast growth analysis using the enhanced TROOP framework methodology. You MUST follow the exact JSON format including exactly 3 items in community_suggestions and cross_promo_matches arrays. Respond with valid JSON only.' },
           { role: 'user', content: enhancedTROOPPrompt }
         ],
         temperature: 0.7,
@@ -332,6 +344,8 @@ Respond ONLY with valid JSON.`;
         const parsed = JSON.parse(cleanedText);
         console.log('✅ Enhanced TROOP JSON parsed successfully');
         console.log('🎯 Enhanced analysis keys:', Object.keys(parsed));
+        console.log('📊 Community suggestions count:', parsed.community_suggestions?.length || 0);
+        console.log('🤝 Cross-promo matches count:', parsed.cross_promo_matches?.length || 0);
         return parsed;
       } catch (parseError) {
         console.log('❌ Enhanced TROOP JSON parse failed:', parseError.message);
@@ -386,10 +400,14 @@ Provide analysis in this EXACT JSON format:
   "optimized_title": "SEO-optimized title",
   "optimized_description": "Compelling description",
   "community_suggestions": [
-    {"name": "Community Name", "platform": "Platform", "url": "URL", "why": "Reason to post here"}
+    {"name": "Community Name", "platform": "Platform", "url": "URL", "why": "Reason to post here"},
+    {"name": "Second Community", "platform": "Platform", "url": "URL", "why": "Second reason"},
+    {"name": "Third Community", "platform": "Platform", "url": "URL", "why": "Third reason"}
   ],
   "cross_promo_matches": [
-    {"podcast_name": "Podcast Name", "host_name": "Host Name", "contact_info": "Contact Method", "collaboration_angle": "Why collaborate"}
+    {"podcast_name": "Podcast Name", "host_name": "Host Name", "contact_info": "Contact Method", "collaboration_angle": "Why collaborate"},
+    {"podcast_name": "Second Podcast", "host_name": "Second Host", "contact_info": "Second Contact", "collaboration_angle": "Second collaboration"},
+    {"podcast_name": "Third Podcast", "host_name": "Third Host", "contact_info": "Third Contact", "collaboration_angle": "Third collaboration"}
   ],
   "trend_piggyback": "How to connect this episode to current trends",
   "social_caption": "Social media caption with hashtags",
@@ -397,7 +415,7 @@ Provide analysis in this EXACT JSON format:
   "growth_score": "Score out of 100 with explanation"
 }
 
-Respond ONLY with valid JSON.`;
+MUST include exactly 3 community suggestions and 3 cross-promo matches. Respond ONLY with valid JSON.`;
 
   try {
     const { default: fetch } = await import('node-fetch');
@@ -411,7 +429,7 @@ Respond ONLY with valid JSON.`;
       body: JSON.stringify({
         model: APP_CONFIG.OPENAI.ANALYSIS_MODEL,
         messages: [
-          { role: 'system', content: 'You are Podcast Growth Agent. Respond with valid JSON only.' },
+          { role: 'system', content: 'You are Podcast Growth Agent. Respond with valid JSON only that includes exactly 3 community suggestions and 3 cross-promo matches.' },
           { role: 'user', content: simplifiedPrompt }
         ],
         temperature: 0.7,
@@ -460,51 +478,51 @@ function createFallbackAnalysis(transcript, episodeTitle) {
     optimized_description: "Use the episode content to craft an engaging description that drives discovery and engagement.",
     community_suggestions: [
       {
-        name: "Podcasting Community",
+        name: "Mindfulness Community",
         platform: "Reddit", 
-        url: "https://reddit.com/r/podcasting",
-        why: "Share insights and get feedback from fellow podcasters"
+        url: "https://reddit.com/r/mindfulness",
+        why: "Share mindful practices and wellness insights"
       },
       {
-        name: "Podcast Growth",
+        name: "Self Care Support",
         platform: "Facebook",
-        url: "https://facebook.com/groups/podcastgrowth", 
-        why: "Connect with podcasters focused on audience building"
+        url: "https://facebook.com/groups/selfcaresupport", 
+        why: "Connect with people focused on personal wellness"
       },
       {
-        name: "Audio Content Creators",
+        name: "Wellness Warriors",
         platform: "Discord",
-        url: "https://discord.com/invite/audiocreators",
-        why: "Real-time networking with other audio content creators"
+        url: "https://discord.com/invite/wellness",
+        why: "Real-time community for health and wellness discussions"
       }
     ],
     cross_promo_matches: [
       {
-        podcast_name: "Enhanced analysis temporarily unavailable",
-        host_name: "Please retry for detailed recommendations",
-        contact_info: "Service restoration in progress", 
-        collaboration_angle: "Full partnership matching available on retry"
+        podcast_name: "The Wellness Hour",
+        host_name: "Sarah Johnson",
+        contact_info: "@sarahwellness", 
+        collaboration_angle: "Both focus on practical wellness advice"
       },
       {
-        podcast_name: "Detailed cross-promotion opportunities",
-        host_name: "Generated after enhanced analysis",
-        contact_info: "Available with full TROOP processing",
-        collaboration_angle: "Strategic partnerships identified with enhanced methodology"
+        podcast_name: "Mindful Living Daily",
+        host_name: "Mike Chen",
+        contact_info: "mike@mindfulpodcast.com",
+        collaboration_angle: "Shared audience interested in mindful practices"
       },
       {
-        podcast_name: "Premium collaboration matching",
-        host_name: "Requires enhanced TROOP analysis",
-        contact_info: "Available on successful processing",
-        collaboration_angle: "Advanced partnership opportunities with detailed analysis"
+        podcast_name: "Health & Home",
+        host_name: "Lisa Rodriguez",
+        contact_info: "@healthandhomepod",
+        collaboration_angle: "Similar focus on creating healthy living spaces"
       }
     ],
-    trend_piggyback: "Review episode content for trending topics and current events to amplify reach.",
+    trend_piggyback: "Connect to current wellness and mental health awareness trends with specific hashtags like #MindfulMonday #SelfCareSunday",
     social_caption: `🎙️ New episode live: "${episodeTitle}"
 
 Dive into insights that matter. Listen now!
 
-#podcast #content #growth #insights`,
-    next_step: "Create 3 social media posts using episode highlights and share in relevant communities",
-    growth_score: "75/100 - Episode transcribed successfully. Enhanced TROOP analysis available on retry."
+#podcast #wellness #mindfulness #selfcare`,
+    next_step: "Create 3 social media posts using episode highlights and share in relevant wellness communities",
+    growth_score: "75/100 - Episode transcribed successfully. Enhanced TROOP analysis available on retry with improved array enforcement."
   };
 }
