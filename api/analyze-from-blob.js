@@ -50,7 +50,9 @@ export default async function handler(req, res) {
       throw new Error(`Failed to download from blob: ${fileResponse.statusText}`);
     }
 
-    const fileBuffer = await fileResponse.buffer();
+    // FIX 1: Use arrayBuffer() instead of deprecated buffer()
+    const fileArrayBuffer = await fileResponse.arrayBuffer();
+    const fileBuffer = Buffer.from(fileArrayBuffer);
     console.log(`📁 Downloaded ${fileBuffer.length} bytes from blob`);
 
     res.write(JSON.stringify({
@@ -315,8 +317,8 @@ Respond ONLY with valid JSON that includes exactly 3 community suggestions and e
           { role: 'user', content: enhancedTROOPPrompt }
         ],
         temperature: 0.7,
-        max_tokens: 4000, // Increased for enhanced analysis
-        timeout: 60000 // 60 second timeout
+        max_tokens: 4000
+        // FIX 2: Removed timeout parameter - OpenAI API doesn't support this
       })
     });
 
