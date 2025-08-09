@@ -1,5 +1,6 @@
 // api/analyze-apple-podcast.js
-// Apple Podcasts URL → metadata → fetch MP3 to Buffer (no /tmp) → upload to Vercel Blob → Groq Whisper → Enhanced TROOP (JSON-forced + retries)
+// Apple URL → metadata → stream remote MP3 → Vercel Blob → Groq Whisper → TROOP
+// No /tmp usage. Mirrors your working MP3 flow.
 
 import { setCorsHeaders } from '../lib/cors.js';
 import FormData from 'form-data';
@@ -16,8 +17,9 @@ const APP_CONFIG = {
     CHAT_URL: 'https://api.openai.com/v1/chat/completions',
     ANALYSIS_MODEL: 'gpt-4o-mini',
   },
-  HARD_SIZE_LIMIT_BYTES: 1024 * 1024 * 300, // 300MB cap to avoid OOM
-  FETCH_TIMEOUT_MS: 60_000,
+  HARD_SIZE_LIMIT_BYTES: 1024 * 1024 * 300, // 300MB guard
+  HTTP_TIMEOUT_MS: 45_000,
+  RETRIES: 2,
 };
 
 export default async function handler(req, res) {
@@ -25,106 +27,89 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const startTime = Date.now();
+  const start = Date.now();
   const debug = [];
 
   try {
     const { appleUrl, title } = await readJsonBody(req);
     if (!appleUrl) return res.status(400).json({ error: 'Apple Podcast URL is required' });
 
-    if (!process.env.BLOB_READ_WRITE_TOKEN) {
-      return res.status(500).json({ error: 'Missing BLOB_READ_WRITE_TOKEN env var' });
-    }
-    if (!process.env.GROQ_API_KEY) {
-      return res.status(500).json({ error: 'Missing GROQ_API_KEY env var' });
-    }
-    if (!process.env.OPENAI_API_KEY) {
-      return res.status(500).json({ error: 'Missing OPENAI_API_KEY env var' });
-    }
-
     debug.push(`🚀 Start Apple URL flow: ${appleUrl}`);
-    debug.push('🔎 Fetching metadata (metadataOnly=true)…');
 
-    // 1) Metadata only (fast)
+    // 1) Get episode metadata (fast)
     const meta = await getEpisodeMetadata(appleUrl, debug);
     const episodeTitle = meta.title || title || 'Episode';
     const podcastTitle = meta.podcast_title || meta.podcastTitle || 'Podcast';
     const audioUrl = pickAudioUrl(meta);
+
     if (!audioUrl) {
-      return res.status(400).json({ error: 'No audio URL found in episode metadata.', debug });
+      return res.status(400).json({
+        error: 'No audio URL found in episode metadata (enclosure missing).',
+        debug,
+      });
     }
 
-    debug.push(`🎉 Metadata: "${episodeTitle}" | Podcast: "${podcastTitle}"`);
-    debug.push(`🎵 Enclosure URL: ${String(audioUrl).slice(0, 160)}…`);
+    debug.push(`🎉 Metadata extracted: "${episodeTitle}"`);
+    debug.push(`🎵 MP3: ${String(audioUrl).slice(0, 180)}…`);
 
-    // 2) Download MP3 fully into memory (cap to 300MB)
-    debug.push('📥 Downloading MP3 into memory (no /tmp)…');
-    const { buffer: fileBuffer, sizeBytes } = await downloadToBufferWithCap(audioUrl, APP_CONFIG.HARD_SIZE_LIMIT_BYTES, APP_CONFIG.FETCH_TIMEOUT_MS);
-    debug.push(`📦 MP3 size: ~${Math.round(sizeBytes / 1024 / 1024)}MB`);
-
-    // 3) Upload to Vercel Blob (public)
-    const blobName = `apple/${slugify(podcastTitle)}-${slugify(episodeTitle)}-${Date.now()}.mp3`;
-    debug.push(`☁️ Uploading to Vercel Blob: ${blobName}`);
-
-    const putResult = await put(blobName, fileBuffer, {
-      access: 'public',
-      contentType: 'audio/mpeg',
-      token: process.env.BLOB_READ_WRITE_TOKEN,
-      addRandomSuffix: false,
-    });
-
-    const blobUrl = putResult?.url;
-    if (!blobUrl) {
-      throw new Error('Blob upload returned no URL');
+    // 2) HEAD check to fail fast on huge files
+    const { contentLength, contentType } = await headInfo(audioUrl);
+    if (contentLength && contentLength > APP_CONFIG.HARD_SIZE_LIMIT_BYTES) {
+      return res.status(413).json({
+        error: `Audio too large (${Math.round(contentLength / 1024 / 1024)}MB). Use MP3 upload path.`,
+        debug,
+      });
     }
+
+    // 3) Stream remote MP3 → Vercel Blob (no /tmp)
+    debug.push('☁️ Uploading remote MP3 to Vercel Blob (stream)…');
+    const fileName = makeSafeFileName(`${episodeTitle}-${Date.now()}.mp3`);
+    const blobResult = await uploadRemoteToBlob(audioUrl, fileName, contentType || 'audio/mpeg');
+    const blobUrl = blobResult.url;
     debug.push(`✅ Blob stored: ${blobUrl}`);
 
-    // 4) Transcribe with Groq (use same buffer)
-    debug.push('⚡ Transcribing via Groq Whisper…');
-    const transcription = await transcribeWithGroqBuffer(fileBuffer, episodeTitle);
-    debug.push(`📝 Transcript chars: ${transcription.transcript.length}`);
+    // 4) Download Blob → Buffer → Groq Whisper
+    debug.push('⚡ Transcribing from Blob via Groq…');
+    const { transcript, metrics } = await transcribeBlobWithGroq(blobUrl, fileName);
+    debug.push(`✅ Transcription complete, chars: ${transcript.length}`);
 
-    // 5) Enhanced TROOP analysis (JSON-forced + retries + distill)
+    // 5) TROOP analysis (JSON forced + retries + distill)
     debug.push('🧠 Running Enhanced TROOP analysis…');
-    const analysis = await analyzeWithEnhancedTROOP(
-      transcription.transcript,
-      episodeTitle,
-      podcastTitle
-    );
-    debug.push('🏁 Enhanced TROOP analysis completed');
+    const analysis = await analyzeWithEnhancedTROOP(transcript, episodeTitle, podcastTitle);
+    debug.push('✅ Enhanced TROOP analysis completed successfully');
 
-    const processingTime = Date.now() - startTime;
+    const processing_time_ms = Date.now() - start;
 
     return res.status(200).json({
       success: true,
-      source: 'Apple URL + Vercel Blob + Groq Whisper + Enhanced TROOP',
+      source: 'Apple URL → Blob → Groq Whisper → TROOP',
       metadata: {
         title: episodeTitle,
-        duration: meta.duration || transcription.metrics.durationSeconds,
+        duration: meta.duration || metrics.durationSeconds,
         podcastTitle,
         originalUrl: appleUrl,
         searchTerm: meta.search_term,
         listenNotesId: meta.listennotes_id,
-        audioUrl,             // original enclosure
-        blobUrl,              // our stored copy
-        transcriptionSource: transcription.metrics.source,
-        audio_metrics: transcription.metrics,
-        processing_time_ms: processingTime,
+        audioUrl,
+        blobUrl,
+        transcriptionSource: metrics.source,
+        audio_metrics: metrics,
         processed_at: new Date().toISOString(),
-        api_version: '4.3-apple-blob-troop-json',
+        processing_time_ms,
+        api_version: '4.3-apple-blob-troop',
       },
-      transcript: transcription.transcript,
+      transcript,
       description: meta.description,
       keywords: meta.keywords || [],
       analysis,
       debug,
     });
   } catch (err) {
-    const processingTime = Date.now() - startTime;
+    const processing_time_ms = Date.now() - start;
     return res.status(500).json({
       error: 'Analysis failed',
       details: String(err?.message || err),
-      processing_time_ms: processingTime,
+      processing_time_ms,
     });
   }
 }
@@ -140,9 +125,33 @@ async function readJsonBody(req) {
   return JSON.parse(raw);
 }
 
-async function getEpisodeMetadata(appleUrl, debug) {
+function makeSafeFileName(name) {
+  return name.replace(/[^\w.\-]+/g, '_').slice(0, 120);
+}
+
+async function fetchWithRetries(url, opts = {}, retries = APP_CONFIG.RETRIES) {
   const { default: fetch } = await import('node-fetch');
-  const r = await fetch(APP_CONFIG.METADATA_URL, {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), APP_CONFIG.HTTP_TIMEOUT_MS);
+
+  try {
+    const resp = await fetch(url, { ...opts, signal: controller.signal });
+    clearTimeout(t);
+    if (!resp.ok) {
+      if (retries > 0 && resp.status >= 500) {
+        return fetchWithRetries(url, opts, retries - 1);
+      }
+    }
+    return resp;
+  } catch (e) {
+    clearTimeout(t);
+    if (retries > 0) return fetchWithRetries(url, opts, retries - 1);
+    throw e;
+  }
+}
+
+async function getEpisodeMetadata(appleUrl, debug) {
+  const r = await fetchWithRetries(APP_CONFIG.METADATA_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ url: appleUrl, metadataOnly: true }),
@@ -154,8 +163,8 @@ async function getEpisodeMetadata(appleUrl, debug) {
   }
 
   const text = await r.text();
+  // service streams JSONL; we pick the last parseable line with title
   const lines = text.trim().split('\n').filter(Boolean);
-  // pick the last good JSON line
   for (const line of lines.reverse()) {
     try {
       const parsed = JSON.parse(line);
@@ -183,76 +192,72 @@ function extractBasicMetadataFromUrl(appleUrl) {
   };
 }
 
-function slugify(s = '') {
-  return String(s)
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 60);
-}
-
-async function downloadToBufferWithCap(url, maxBytes, timeoutMs) {
-  const { default: fetch } = await import('node-fetch');
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs).unref?.();
-
-  const resp = await fetch(url, { signal: controller.signal });
-  clearTimeout(t);
-
-  if (!resp.ok || !resp.body) {
-    throw new Error(`Failed to fetch audio: ${resp.status} ${resp.statusText}`);
+async function headInfo(url) {
+  try {
+    const r = await fetchWithRetries(url, { method: 'HEAD' });
+    if (!r.ok) return { contentLength: 0, contentType: '' };
+    return {
+      contentLength: Number(r.headers.get('content-length') || 0),
+      contentType: r.headers.get('content-type') || '',
+    };
+  } catch {
+    // Some hosts block HEAD — we’ll proceed anyway.
+    return { contentLength: 0, contentType: '' };
   }
-
-  const chunks = [];
-  let total = 0;
-
-  await new Promise((resolve, reject) => {
-    resp.body.on('data', (chunk) => {
-      total += chunk.length;
-      if (total > maxBytes) {
-        resp.body.destroy();
-        reject(new Error(`Audio too large (${Math.round(total / 1024 / 1024)}MB). Use MP3 upload path.`));
-        return;
-      }
-      chunks.push(chunk);
-    });
-    resp.body.on('end', resolve);
-    resp.body.on('error', reject);
-  });
-
-  return { buffer: Buffer.concat(chunks), sizeBytes: total };
 }
 
-/* ---------------------------
-   Transcription (Groq)
-----------------------------*/
+async function uploadRemoteToBlob(remoteUrl, fileName, contentTypeGuess) {
+  const res = await fetchWithRetries(remoteUrl, { method: 'GET' });
+  if (!res.ok || !res.body) {
+    const msg = await safeReadText(res);
+    throw new Error(`Remote MP3 download failed: ${res.status} ${res.statusText} ${msg ? `| ${msg}` : ''}`);
+  }
+  const ct = res.headers.get('content-type') || contentTypeGuess || 'audio/mpeg';
+  // Stream response directly into Blob
+  return await put(fileName, res.body, {
+    access: 'public',
+    contentType: ct,
+  });
+}
 
-async function transcribeWithGroqBuffer(fileBuffer, filename = 'Episode') {
+async function safeReadText(resp) {
+  try { return await resp.text(); } catch { return ''; }
+}
+
+async function transcribeBlobWithGroq(blobUrl, filenameBase = 'Episode') {
   const groqApiKey = process.env.GROQ_API_KEY;
   if (!groqApiKey) throw new Error('Groq API key not configured');
 
   const { default: fetch } = await import('node-fetch');
-  const formData = new FormData();
-  formData.append('file', fileBuffer, {
-    filename: `${filename}.mp3`,
-    contentType: 'audio/mpeg',
-  });
-  formData.append('model', APP_CONFIG.GROQ.MODEL);
-  formData.append('response_format', APP_CONFIG.GROQ.RESPONSE_FORMAT);
 
-  const response = await fetch(APP_CONFIG.GROQ.API_URL, {
+  // Download Blob → Buffer
+  const blobResp = await fetch(blobUrl);
+  if (!blobResp.ok) {
+    const txt = await safeReadText(blobResp);
+    throw new Error(`Failed to read Blob for transcription: ${blobResp.status} ${blobResp.statusText} ${txt ? `| ${txt}` : ''}`);
+  }
+  const arr = await blobResp.arrayBuffer();
+  const fileBuffer = Buffer.from(arr);
+
+  // Multipart → Groq
+  const form = new FormData();
+  form.append('file', fileBuffer, { filename: `${filenameBase}.mp3`, contentType: 'audio/mpeg' });
+  form.append('model', APP_CONFIG.GROQ.MODEL);
+  form.append('response_format', APP_CONFIG.GROQ.RESPONSE_FORMAT);
+
+  const groqResp = await fetch(APP_CONFIG.GROQ.API_URL, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${groqApiKey}`, ...formData.getHeaders() },
-    body: formData,
+    headers: { Authorization: `Bearer ${groqApiKey}`, ...form.getHeaders() },
+    body: form,
   });
 
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => '');
-    throw new Error(`Groq API error: ${response.status} ${errorText}`);
+  if (!groqResp.ok) {
+    const errText = await safeReadText(groqResp);
+    throw new Error(`Groq API error: ${groqResp.status} ${groqResp.statusText} ${errText ? `| ${errText}` : ''}`);
   }
 
-  const transcript = await response.text();
-  const durationEstimate = transcript.length / 8; // your heuristic
+  const transcript = await groqResp.text();
+  const durationEstimate = transcript.length / 8;
   return {
     transcript,
     metrics: {
@@ -265,7 +270,7 @@ async function transcribeWithGroqBuffer(fileBuffer, filename = 'Episode') {
 }
 
 /* ---------------------------------
-   Enhanced TROOP (JSON-forced + retries + distill)
+   Enhanced TROOP (JSON-forced + retries)
 ---------------------------------- */
 
 async function analyzeWithEnhancedTROOP(transcript, episodeTitle = '', podcastTitle = '') {
@@ -405,77 +410,74 @@ ${transcript.length > 15000 ? transcript.substring(0, 15000) + '\n\n[Transcript 
 
 Respond ONLY with valid JSON.`;
 
-  async function callOpenAI(prompt) {
-    const { default: fetch } = await import('node-fetch');
-    const resp = await fetch(APP_CONFIG.OPENAI.CHAT_URL, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${openaiApiKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: APP_CONFIG.OPENAI.ANALYSIS_MODEL,
-        response_format: { type: 'json_object' }, // force JSON
-        temperature: 0.7,
-        max_tokens: 4000,
-        messages: [
-          { role: 'system', content: baseSystem },
-          { role: 'user', content: prompt }
-        ],
-      }),
-    });
+  const attempt1 = await callOpenAI(enhancedTROOPPrompt, openaiApiKey, baseSystem);
+  if (attempt1.ok) return attempt1.json;
 
-    const status = resp.status;
-    const text = await resp.text();
+  const attempt2 = await callOpenAI(enhancedTROOPPrompt, openaiApiKey, baseSystem);
+  if (attempt2.ok) return attempt2.json;
 
-    if (status < 200 || status >= 300) {
-      return { ok: false, status, errorText: text };
-    }
-
-    let data;
-    try { data = JSON.parse(text); }
-    catch (e) { return { ok: false, status, errorText: `JSON parse error: ${e.message} | raw=${text.slice(0, 400)}...` }; }
-
-    const content = data.choices?.[0]?.message?.content;
-    if (!content) return { ok: false, status, errorText: `No content in response | raw=${text.slice(0, 400)}...` };
-
-    try {
-      const parsed = JSON.parse(content);
-      return { ok: true, json: parsed };
-    } catch {
-      const match = content.match(/\{[\s\S]*\}/);
-      if (match) { try { return { ok: true, json: JSON.parse(match[0]) }; } catch {} }
-      return { ok: false, status, errorText: `Model content not valid JSON: ${content.slice(0, 300)}...` };
-    }
-  }
-
-  // Try 1
-  let attempt = await callOpenAI(enhancedTROOPPrompt);
-  if (attempt.ok) return attempt.json;
-
-  // Try 2 (transient)
-  attempt = await callOpenAI(enhancedTROOPPrompt);
-  if (attempt.ok) return attempt.json;
-
-  // Distill → Analyze
+  // Distill, then try again
   const distilled = await distillTranscript(transcript, openaiApiKey, baseSystem);
   const distilledPrompt = enhancedTROOPPrompt.replace(
     /\*\*TRANSCRIPT:\*\*[\s\S]*$/m,
     `**TRANSCRIPT (DISTILLED):**\n${distilled}\n\nRespond ONLY with valid JSON.`
   );
-  attempt = await callOpenAI(distilledPrompt);
-  if (attempt.ok) return attempt.json;
+  const attempt3 = await callOpenAI(distilledPrompt, openaiApiKey, baseSystem);
+  if (attempt3.ok) return attempt3.json;
 
   return {
     ...createFallbackAnalysis(transcript, episodeTitle),
     _debug_troop_fail: {
-      first_error: attempt.errorText,
+      first_error: attempt1.errorText,
+      second_error: attempt2.errorText,
+      third_error: attempt3.errorText,
       note: 'Fell back after 2 direct attempts + distilled run.',
     },
   };
 }
 
-async function distillTranscript(transcript, openaiApiKey, baseSystem) {
+async function callOpenAI(prompt, apiKey, baseSystem) {
+  const { default: fetch } = await import('node-fetch');
+  const resp = await fetch(APP_CONFIG.OPENAI.CHAT_URL, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: APP_CONFIG.OPENAI.ANALYSIS_MODEL,
+      response_format: { type: 'json_object' },
+      temperature: 0.7,
+      max_tokens: 4000,
+      messages: [
+        { role: 'system', content: baseSystem },
+        { role: 'user', content: prompt },
+      ],
+    }),
+  });
+
+  const status = resp.status;
+  const raw = await resp.text();
+
+  if (status < 200 || status >= 300) {
+    return { ok: false, status, errorText: raw };
+  }
+
+  let data;
+  try { data = JSON.parse(raw); }
+  catch (e) { return { ok: false, status, errorText: `JSON parse error: ${e.message} | raw=${raw.slice(0, 400)}...` }; }
+
+  const content = data.choices?.[0]?.message?.content;
+  if (!content) return { ok: false, status, errorText: `No content | raw=${raw.slice(0, 400)}...` };
+
+  try {
+    const parsed = JSON.parse(content);
+    return { ok: true, json: parsed };
+  } catch {
+    const m = content.match(/\{[\s\S]*\}/);
+    if (m) { try { return { ok: true, json: JSON.parse(m[0]) }; } catch {} }
+    return { ok: false, status, errorText: `Model content not valid JSON: ${content.slice(0, 300)}...` };
+  }
+}
+
+async function distillTranscript(transcript, apiKey, baseSystem) {
   const distilledPrompt = [
     'Condense the following transcript into JSON with keys:',
     '{ "summary": "...", "key_points": ["..."], "entities": ["..."], "topics": ["..."], "quotes": ["..."] }',
@@ -488,10 +490,7 @@ async function distillTranscript(transcript, openaiApiKey, baseSystem) {
   const { default: fetch } = await import('node-fetch');
   const resp = await fetch(APP_CONFIG.OPENAI.CHAT_URL, {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${openaiApiKey}`,
-      'Content-Type': 'application/json',
-    },
+    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
       model: APP_CONFIG.OPENAI.ANALYSIS_MODEL,
       response_format: { type: 'json_object' },
@@ -504,9 +503,9 @@ async function distillTranscript(transcript, openaiApiKey, baseSystem) {
     }),
   });
 
-  const text = await resp.text();
+  const raw = await resp.text();
   try {
-    const data = JSON.parse(text);
+    const data = JSON.parse(raw);
     const content = data.choices?.[0]?.message?.content || '{}';
     const json = JSON.parse(content);
     return [
