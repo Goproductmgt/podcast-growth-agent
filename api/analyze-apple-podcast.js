@@ -104,7 +104,7 @@ export default async function handler(req, res) {
         transcriptionSource: transcription.metrics.source,
         processing_time_ms: processingTime,
         processed_at: new Date().toISOString(),
-        api_version: '5.1-apple-url-blob-chunked',
+        api_version: '5.2-apple-url-blob-chunked',
         blob_url: blob.url,
       },
       transcript: transcription.transcript,
@@ -165,6 +165,9 @@ function pickAudioUrl(meta) {
 
 function extractBasicMetadataFromUrl(appleUrl) {
   const parts = appleUrl.split('/');
+  theTitle: {
+    // keep it simple; best-effort title from URL
+  }
   const titlePart = parts.find((p) => p.includes('-') && !p.includes('id'));
   const title = titlePart
     ? titlePart.replace(/-/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase())
@@ -333,9 +336,11 @@ async function analyzeWithTROOP(transcript, episodeTitle = '', podcastTitle = ''
 
   const baseSystem = [
     'You are Podcast Growth Agent.',
-    'Respond with valid JSON only. No markdown, no code fences, no commentary.',
-    'Do NOT provide medical advice; focus on marketing/SEO/community.',
-    'Arrays MUST contain exactly 3 items for tweetable_quotes, community_suggestions, and cross_promo_matches.'
+    'Return valid JSON only. No markdown, no code fences, no commentary.',
+    'Arrays MUST contain exactly 3 items for tweetable_quotes, community_suggestions, cross_promo_matches.',
+    'Each community_suggestions item MUST include first_post (<=220 chars).',
+    'Each cross_promo_matches item MUST include outreach_dm (<=420 chars).',
+    'Focus strictly on marketing/SEO/community growth; no medical or sensitive guidance.'
   ].join(' ');
 
   const enhancedTROOPPrompt = buildTroopPrompt(transcript, episodeTitle, podcastTitle);
@@ -395,7 +400,7 @@ async function analyzeWithTROOP(transcript, episodeTitle = '', podcastTitle = ''
   const distilled = await distillTranscript(transcript, openaiApiKey, baseSystem);
   const distilledPrompt = enhancedTROOPPrompt.replace(
     /\*\*TRANSCRIPT:\*\*[\s\S]*$/m,
-    `**TRANSCRIPT (DISTILLED):**\n${distilled}\n\nRespond ONLY with valid JSON.`
+    `**TRANSCRIPT (DISTILLED):**\n${distilled}\n\nReturn ONLY valid JSON.`
   );
   attempt = await callOpenAI(distilledPrompt);
   if (attempt.ok) return attempt.json;
@@ -407,49 +412,133 @@ async function analyzeWithTROOP(transcript, episodeTitle = '', podcastTitle = ''
 }
 
 function buildTroopPrompt(transcript, episodeTitle, podcastTitle) {
-  return `**TASK:**
-Analyze the provided transcript and generate a comprehensive 10-section growth strategy.
+  const safeTranscript =
+    transcript.length > 15000
+      ? transcript.slice(0, 15000) + '\n\n[Transcript truncated for processing]'
+      : transcript;
 
-**ROLE:** Podcast Growth Agent (marketing/SEO/community).
+  return `
+Section 1: Task Definition
+**TASK:**
+Analyze the provided podcast episode transcript and generate a comprehensive 10-section growth strategy to expand audience reach. Use the exact spoken words to extract meaning, then create actionable marketing recommendations that improve findability, discoverability, and reach by:
+(a) Strategically selecting primary intent terms listeners actively search for.
+(b) Expanding into 3–5 semantic neighbors (conceptually related terms) to join ongoing topically relevant conversations.
+(c) Ensuring all recommendations connect to actual transcript content.
 
-**CRITICAL REQUIREMENTS:**
-- EXACTLY 3 tweetable quotes
-- EXACTLY 3 community suggestions
-- EXACTLY 3 cross-promo matches
-- Niche communities (1K–100K), not generic
-- Use actual transcript content
+Section 2: Role Assignment
+**ROLE:**
+You are Podcast Growth Agent — an expert strategist with 10+ years helping independent podcasters grow. Core specialties:
+1. Deep transcript semantic analysis
+2. Search-intent mapping & expansion
+3. Niche community discovery (1K–100K members)
+4. Platform-native copycraft
+5. Cross-promo matchmaking for complementary audiences
+6. Solo-creator growth prioritization
 
-**OUTPUT:** (valid JSON, arrays sized exactly as specified)
+Section 3: Critical Requirements ⚠️ ENFORCEMENT LAYER
+**CRITICAL REQUIREMENTS (HARD):**
+- EXACTLY 3 tweetable quotes (verbatim from transcript)
+- EXACTLY 3 community suggestions (niche, 1K–100K members; no generic communities like r/podcasts)
+- EXACTLY 3 cross-promo matches (complementary shows, similar audience size)
+- All data must be transcript-grounded
+- For each keyword/topic set, include 1 **primary intent term** + 3–5 **semantic neighbors** (conceptually related terms)
+- Each \`community_suggestions\` item MUST include \`first_post\` (≤220 chars, value-first, no link)
+- Each \`cross_promo_matches\` item MUST include \`outreach_dm\` (≤420 chars, friendly, specific swap ask)
+
+Section 4: JSON Output Format 📋 CORE STRUCTURE
+Return only valid JSON (no prose). Do not include keys not listed below.
+
 {
-  "episode_summary": "...",
-  "tweetable_quotes": ["...", "...", "..."],
-  "topics_keywords": ["...", "...", "...", "...", "..."],
-  "optimized_title": "...",
-  "optimized_description": "...",
+  "episode_summary": "2–3 engaging sentences that convey the guest/topic’s core promise and listener outcome.",
+  "tweetable_quotes": [
+    "Exact quote #1 from transcript...",
+    "Exact quote #2 from transcript...",
+    "Exact quote #3 from transcript..."
+  ],
+  "topics_keywords": [
+    {
+      "primary_intent": "Main searchable term from transcript",
+      "semantic_neighbors": ["related term 1", "related term 2", "related term 3", "related term 4", "related term 5"]
+    },
+    { "primary_intent": "...", "semantic_neighbors": ["..."] },
+    { "primary_intent": "...", "semantic_neighbors": ["..."] }
+  ],
+  "optimized_title": "SEO-optimized title (≤70 chars, contains 1 primary intent term)",
+  "optimized_description": "150–200 words, includes at least 3 primary intents and 3–5 semantic neighbors woven naturally, with a single CTA to play.",
   "community_suggestions": [
-    {"name":"...","platform":"...","url":"...","why":"...","post_angle":"...","member_size":"...","engagement_strategy":"..."},
-    {"name":"...","platform":"...","url":"...","why":"...","post_angle":"...","member_size":"...","engagement_strategy":"..."},
-    {"name":"...","platform":"...","url":"...","why":"...","post_angle":"...","member_size":"...","engagement_strategy":"..."}
+    {
+      "name": "Niche community (1K–100K)",
+      "platform": "Platform name",
+      "url": "Direct URL",
+      "member_size": "Approx count",
+      "why": "Specific problem this episode addresses for this community",
+      "post_angle": "Conversation-first hook",
+      "engagement_strategy": "Platform-native tactic + timing",
+      "conversion_potential": "Why they are likely to click play",
+      "first_post": "Copy-paste, ≤220 chars, includes 1 transcript phrase",
+      "confidence": "high|medium"
+    },
+    { "name": "...", "platform": "...", "url": "...", "member_size": "...", "why": "...", "post_angle": "...", "engagement_strategy": "...", "conversion_potential": "...", "first_post": "...", "confidence": "..." },
+    { "name": "...", "platform": "...", "url": "...", "member_size": "...", "why": "...", "post_angle": "...", "engagement_strategy": "...", "conversion_potential": "...", "first_post": "...", "confidence": "..." }
   ],
   "cross_promo_matches": [
-    {"podcast_name":"...","host_name":"...","contact_info":"...","collaboration_angle":"...","suggested_approach":"..."},
-    {"podcast_name":"...","host_name":"...","contact_info":"...","collaboration_angle":"...","suggested_approach":"..."},
-    {"podcast_name":"...","host_name":"...","contact_info":"...","collaboration_angle":"...","suggested_approach":"..."}
+    {
+      "podcast_name": "Complementary podcast",
+      "why_match": "Fit grounded in transcript themes",
+      "audience_overlap": "Estimated %",
+      "collaboration_value": "Swap angle (promo, feed drop, clip trade)",
+      "outreach_timing": "Best window (day/time)",
+      "outreach_dm": "Copy-paste DM, ≤420 chars, includes 1 transcript phrase",
+      "confidence": "high|medium"
+    },
+    { "podcast_name": "...", "why_match": "...", "audience_overlap": "...", "collaboration_value": "...", "outreach_timing": "...", "outreach_dm": "...", "confidence": "..." },
+    { "podcast_name": "...", "why_match": "...", "audience_overlap": "...", "collaboration_value": "...", "outreach_timing": "...", "outreach_dm": "...", "confidence": "..." }
   ],
-  "trend_piggyback":"...",
-  "social_caption":"...",
-  "next_step":"...",
-  "growth_score":"..."
+  "trend_piggyback": "One current, durable conversation to join; specify angle and why it fits.",
+  "social_caption": "1–2 punchy sentences tailored to platform; includes 1 primary intent and 1 semantic neighbor.",
+  "next_step": "One concrete action a solo creator can do in ≤20 minutes.",
+  "growth_score": "0–100 (rubric-based)"
 }
 
-**EPISODE:**
-Title: ${episodeTitle || 'New Episode'}
-Podcast: ${podcastTitle || 'Podcast'}
+Section 5: Business Objective
+**OBJECTIVE:**
+Give overwhelmed independent podcasters step-by-step, immediately actionable ways to get more plays per episode without a marketing team or technical expertise.
+
+Section 6: Perspective/Voice
+**PERSPECTIVE:**
+Supportive growth partner. Clear, kind, practical. Avoid generic marketing clichés. Use platform-native, action-driven language.
+
+Section 7: Methodology 🧠 YOUR SECRET SAUCE
+**PROPRIETARY SEMANTIC ANALYSIS METHODOLOGY:**
+1) **Transcript Foundation** — Parse exact phrases, entities, claims, and emotional tone to extract problem statements, promised outcomes, and repeatable listener-search language.
+2) **Semantic Expansion** — For each core theme, identify the **primary intent term** and 3–5 **semantic neighbors** using conceptual similarity, topical adjacency, and audience-relevant variations (similar to Google Broad Match principles).
+3) **Conversation Insertion** — Apply the “birds of a feather” rule: locate active topic clusters where these terms appear in ongoing discussions.
+4) **Niche Community Discovery** — Prefer 1K–100K member spaces with active, recent discussion threads. Score by topical fit and engagement depth.
+5) **Copy Calibration** — Weave primary + neighbor terms into titles, descriptions, captions for expanded surface area without losing authenticity.
+6) **Action Readiness** — Generate \`first_post\` and \`outreach_dm\` fields so creators can take action in under 1 minute.
+7) **Effort/Impact Awareness** — Prioritize tactics solo creators can execute quickly.
+
+Section 8: Context Variables
+**EPISODE INFORMATION:**
+Episode Title: ${episodeTitle || 'New Episode'}
+Podcast: ${podcastTitle || 'Podcast Growth Analysis'}
 
 **TRANSCRIPT:**
-${transcript.length > 15000 ? transcript.slice(0, 15000) + '\n[Truncated]' : transcript}
+${safeTranscript}
 
-Respond ONLY with valid JSON.`;
+Section 9: Community Examples 🎯 GUIDANCE SYSTEM
+**COMMUNITY TARGETING EXAMPLES:**
+- Wellness: mindfulness habit groups (50K–90K), sleep optimization circles (10K–40K)
+- Business: SaaS founder micro-forums (5K–30K), niche indie-hacker threads (20K–80K)
+- Creative: discipline-specific craft groups (15K–70K)
+
+Section 10: Final Enforcement
+**IMPORTANT:**
+- No generic podcast communities
+- Use only transcript-relevant niche communities
+- Arrays = exactly 3 items
+- Output = only the JSON described above
+`;
 }
 
 async function distillTranscript(transcript, openaiApiKey, baseSystem) {
