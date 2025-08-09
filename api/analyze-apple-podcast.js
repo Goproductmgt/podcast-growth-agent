@@ -1,10 +1,9 @@
 // api/analyze-apple-podcast.js
-// Apple Podcasts URL → metadata → /tmp download (retries/timeouts) → upload to Vercel Blob →
-// -> CHUNKED Groq Whisper transcription (Range-based) → Enhanced TROOP (JSON-forced + distilled fallback)
-// Improvements:
-// - Prompt: voice profile + explicit dependency on primary/neighbor keywords across outputs
-// - Output: keep keyword objects AND auto-create flat topics_keywords list for compatibility
-// - Groq: retry on 5xx within each chunk
+// Apple URL → /tmp download → Vercel Blob → CHUNKED Groq Whisper → Enhanced TROOP
+// Upgrades in this version:
+// - Quote extraction/scoring → better tweetables w/ 1–2 smart hashtags
+// - Keep output as strings (tweetable_quotes) + add quotes_candidates_debug for QA
+// - Stronger Groq 5xx handling: more retries, backoff + chunk-size fallback
 
 import { setCorsHeaders } from '../lib/cors.js';
 import { put } from '@vercel/blob';
@@ -14,7 +13,7 @@ import path from 'path';
 import { pipeline } from 'stream/promises';
 
 const APP_CONFIG = {
-  METADATA_URL: 'https://podcast-api-amber.vercel.app/api/transcribe', // metadataOnly=true
+  METADATA_URL: 'https://podcast-api-amber.vercel.app/api/transcribe',
   GROQ: {
     API_URL: 'https://api.groq.com/openai/v1/audio/transcriptions',
     MODEL: 'whisper-large-v3-turbo',
@@ -27,10 +26,10 @@ const APP_CONFIG = {
   HARD_SIZE_LIMIT_BYTES: 1024 * 1024 * 300, // 300MB
   FETCH_TIMEOUT_MS: 60_000,
   MAX_RETRIES: 2,
-  MAX_CHUNK_BYTES: Number(process.env.MAX_CHUNK_MB || 18) * 1024 * 1024, // default 18MB
-  MIN_CHUNK_BYTES: 8 * 1024 * 1024, // 8MB floor
-  GROQ_RETRY_COUNT: 2,
-  GROQ_RETRY_DELAY_MS: 800,
+  MAX_CHUNK_BYTES: Number(process.env.MAX_CHUNK_MB || 18) * 1024 * 1024,
+  MIN_CHUNK_BYTES: 8 * 1024 * 1024,
+  GROQ_RETRY_COUNT: 4,           // was 2
+  GROQ_RETRY_BASE_DELAY_MS: 700, // backoff base
 };
 
 export default async function handler(req, res) {
@@ -94,18 +93,27 @@ export default async function handler(req, res) {
     debug.push('🧠 Running Enhanced TROOP analysis…');
     let analysis = await analyzeWithTROOP(transcription.transcript, episodeTitle, podcastTitle);
 
-    // ---- POST-PROCESS: keep object plan, also produce flat topics_keywords for compatibility/use downstream
+    // If model returned keyword objects, keep them and also flatten for compatibility.
     if (Array.isArray(analysis?.topics_keywords) && typeof analysis.topics_keywords[0] === 'object') {
       const plan = analysis.topics_keywords;
-      analysis.keyword_plan = plan; // keep rich objects
+      analysis.keyword_plan = plan;
       const flat = [];
       for (const k of plan) {
         if (k?.primary_intent) flat.push(String(k.primary_intent));
-        if (Array.isArray(k?.semantic_neighbors)) {
-          for (const n of k.semantic_neighbors) flat.push(String(n));
-        }
+        if (Array.isArray(k?.semantic_neighbors)) for (const n of k.semantic_neighbors) flat.push(String(n));
       }
-      analysis.topics_keywords = Array.from(new Set(flat)).slice(0, 15); // cap a bit
+      analysis.topics_keywords = Array.from(new Set(flat)).slice(0, 15);
+    }
+
+    // If model added quotes_candidates_debug, ensure tweetable_quotes are top 3 w/ hashtags,
+    // otherwise keep what it produced.
+    if ((!analysis.tweetable_quotes || analysis.tweetable_quotes.length !== 3) &&
+        Array.isArray(analysis.quotes_candidates_debug)) {
+      const sorted = [...analysis.quotes_candidates_debug]
+        .sort((a, b) => Number(b?.score || 0) - Number(a?.score || 0))
+        .slice(0, 3)
+        .map(q => typeof q?.text === 'string' ? q.text : '');
+      analysis.tweetable_quotes = sorted.filter(Boolean);
     }
 
     debug.push('✅ TROOP analysis complete');
@@ -125,7 +133,7 @@ export default async function handler(req, res) {
         transcriptionSource: transcription.metrics.source,
         processing_time_ms: processingTime,
         processed_at: new Date().toISOString(),
-        api_version: '5.3-apple-url-blob-chunked',
+        api_version: '5.4-apple-url-blob-chunked',
         blob_url: blob.url,
       },
       transcript: transcription.transcript,
@@ -139,8 +147,6 @@ export default async function handler(req, res) {
       details: String(err.message || err),
       processing_time_ms: processingTime,
     });
-  } finally {
-    // tmp cleanup done in helpers
   }
 }
 
@@ -190,12 +196,7 @@ function extractBasicMetadataFromUrl(appleUrl) {
   const title = titlePart
     ? titlePart.replace(/-/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase())
     : 'Episode';
-  return {
-    title,
-    podcast_title: 'Podcast',
-    description: 'Episode analysis from Apple Podcast URL',
-    duration: 0,
-  };
+  return { title, podcast_title: 'Podcast', description: 'Episode analysis from Apple Podcast URL', duration: 0 };
 }
 
 async function headInfo(url) {
@@ -258,12 +259,11 @@ async function transcribeWithGroqFromBlobChunked(blobUrl, filename, debug = []) 
   const { default: fetch } = await import('node-fetch');
   const groqApiKey = process.env.GROQ_API_KEY;
 
-  // 1) Get Blob size
+  // 1) Blob size
   const head = await fetch(blobUrl, { method: 'HEAD' });
   if (!head.ok) throw new Error(`Blob HEAD failed: ${head.status} ${head.statusText}`);
   const totalBytes = Number(head.headers.get('content-length') || 0);
   if (!totalBytes) {
-    // fall back to single GET (small file)
     const fileRes = await fetch(blobUrl);
     if (!fileRes.ok) throw new Error(`Blob download failed: ${fileRes.status} ${fileRes.statusText}`);
     const arr = await fileRes.arrayBuffer();
@@ -295,31 +295,44 @@ async function transcribeWithGroqFromBlobChunked(blobUrl, filename, debug = []) 
       part += 1;
     } catch (e) {
       const msg = String(e.message || e);
+
+      // Groq 413 → halve chunk and retry same offset
       if (/413/.test(msg) && chunkSize > APP_CONFIG.MIN_CHUNK_BYTES) {
-        // halve chunk and retry same offset
         chunkSize = Math.max(APP_CONFIG.MIN_CHUNK_BYTES, Math.floor(chunkSize / 2));
         debug.push(`↘️ 413 from Groq, reducing chunk size to ~${Math.round(chunkSize / 1024 / 1024)}MB and retrying`);
         continue;
       }
-      // retry 5xx for the same chunk
+
+      // Groq 5xx → retry same chunk w/ backoff; if still failing, halve chunk and retry
       if (/(500|502|503|504)/.test(msg)) {
-        let retried = false;
+        let recovered = false;
         for (let i = 0; i < APP_CONFIG.GROQ_RETRY_COUNT; i++) {
-          await new Promise(r => setTimeout(r, APP_CONFIG.GROQ_RETRY_DELAY_MS * (i + 1)));
+          const delay = APP_CONFIG.GROQ_RETRY_BASE_DELAY_MS * Math.pow(1.6, i) + Math.floor(Math.random() * 200);
+          await new Promise(r => setTimeout(r, delay));
           try {
             const tr2 = await groqOnce(buf, `${filename}.part${part}.mp3`);
             parts.push(tr2.transcript);
-            debug.push(`🔁 Groq 5xx recovered on retry ${i + 1} for chunk ${part}`);
+            debug.push(`🔁 Groq ${/5\d\d/.exec(msg)?.[0] || '5xx'} recovered on retry ${i + 1} for chunk ${part}`);
             offset = end + 1;
             part += 1;
-            retried = true;
+            recovered = true;
             break;
           } catch (e2) {
-            if (i === APP_CONFIG.GROQ_RETRY_COUNT - 1) throw e2;
+            if (i === APP_CONFIG.GROQ_RETRY_COUNT - 1) {
+              // last try: halve the chunk and reloop
+              if (chunkSize > APP_CONFIG.MIN_CHUNK_BYTES) {
+                chunkSize = Math.max(APP_CONFIG.MIN_CHUNK_BYTES, Math.floor(chunkSize / 2));
+                debug.push(`🪓 Persistent 5xx. Halving chunk to ~${Math.round(chunkSize / 1024 / 1024)}MB and retrying`);
+                recovered = true; // let loop retry same offset
+              } else {
+                throw e2;
+              }
+            }
           }
         }
-        if (retried) continue;
+        if (recovered) continue;
       }
+
       throw e;
     }
   }
@@ -358,10 +371,7 @@ async function transcribeWithGroqFromBlobChunked(blobUrl, filename, debug = []) 
 
     const text = await resp.text();
     const dur = text.length / 8;
-    return {
-      transcript: text,
-      metrics: { durationSeconds: Math.round(dur) },
-    };
+    return { transcript: text, metrics: { durationSeconds: Math.round(dur) } };
   }
 }
 
@@ -377,7 +387,7 @@ async function analyzeWithTROOP(transcript, episodeTitle = '', podcastTitle = ''
     'Arrays MUST contain exactly 3 items for tweetable_quotes, community_suggestions, cross_promo_matches.',
     'Each community_suggestions item MUST include first_post (<=220 chars).',
     'Each cross_promo_matches item MUST include outreach_dm (<=420 chars).',
-    'Maintain the episode’s tone/voice consistently across title, description, captions, posts, and DMs.'
+    'Maintain the episode’s tone/voice across title, description, captions, first_post, outreach_dm.'
   ].join(' ');
 
   const enhancedTROOPPrompt = buildTroopPrompt(transcript, episodeTitle, podcastTitle);
@@ -386,42 +396,32 @@ async function analyzeWithTROOP(transcript, episodeTitle = '', podcastTitle = ''
     const { default: fetch } = await import('node-fetch');
     const resp = await fetch(APP_CONFIG.OPENAI.CHAT_URL, {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${openaiApiKey}`,
-        'Content-Type': 'application/json',
-      },
+      headers: { Authorization: `Bearer ${openaiApiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: APP_CONFIG.OPENAI.ANALYSIS_MODEL,
         response_format: { type: 'json_object' },
         temperature: 0.75,
         max_tokens: 4000,
-        messages: [
-          { role: 'system', content: baseSystem },
-          { role: 'user', content: prompt },
-        ],
+        messages: [{ role: 'system', content: baseSystem }, { role: 'user', content: prompt }],
       }),
       signal: AbortSignal.timeout(90_000),
     });
 
     const status = resp.status;
     const text = await resp.text();
+    if (status < 200 || status >= 300) return { ok: false, status, errorText: `HTTP ${status} ${text.slice(0, 400)}` };
 
-    if (status < 200 || status >= 300) {
-      return { ok: false, status, errorText: `HTTP ${status} ${text.slice(0, 400)}` };
+    let data; try { data = JSON.parse(text); } catch (e) {
+      return { ok: false, status, errorText: `JSON parse error: ${e.message} | raw=${text.slice(0, 300)}...` };
     }
-
-    let data;
-    try { data = JSON.parse(text); }
-    catch (e) { return { ok: false, status, errorText: `JSON parse error: ${e.message} | raw=${text.slice(0, 400)}...` }; }
-
     const content = data.choices?.[0]?.message?.content;
-    if (!content) return { ok: false, status, errorText: `No content in response | raw=${text.slice(0, 400)}...` };
+    if (!content) return { ok: false, status, errorText: 'No content in response' };
 
     try { return { ok: true, json: JSON.parse(content) }; }
     catch {
       const match = content.match(/\{[\s\S]*\}/);
       if (match) { try { return { ok: true, json: JSON.parse(match[0]) }; } catch {} }
-      return { ok: false, status, errorText: `Model content not valid JSON` };
+      return { ok: false, status, errorText: 'Model content not valid JSON' };
     }
   }
 
@@ -442,17 +442,12 @@ async function analyzeWithTROOP(transcript, episodeTitle = '', podcastTitle = ''
   attempt = await callOpenAI(distilledPrompt);
   if (attempt.ok) return attempt.json;
 
-  return {
-    ...createFallbackAnalysis(transcript, episodeTitle),
-    _debug_troop_fail: attempt.errorText || 'unknown'
-  };
+  return { ...createFallbackAnalysis(transcript, episodeTitle), _debug_troop_fail: attempt.errorText || 'unknown' };
 }
 
 function buildTroopPrompt(transcript, episodeTitle, podcastTitle) {
   const safeTranscript =
-    transcript.length > 15000
-      ? transcript.slice(0, 15000) + '\n\n[Transcript truncated for processing]'
-      : transcript;
+    transcript.length > 15000 ? transcript.slice(0, 15000) + '\n\n[Transcript truncated for processing]' : transcript;
 
   return `
 Section 1: Task Definition
@@ -474,110 +469,81 @@ You are Podcast Growth Agent — an expert strategist with 10+ years helping ind
 
 Section 3: Critical Requirements ⚠️ ENFORCEMENT LAYER
 **CRITICAL REQUIREMENTS (HARD):**
-- EXACTLY 3 tweetable quotes (verbatim from transcript)
-- EXACTLY 3 community suggestions (niche, 1K–100K members; no generic communities like r/podcasts)
+- EXACTLY 3 tweetable quotes (verbatim or lightly edited for clarity) with 1–2 relevant hashtags
+- EXACTLY 3 community suggestions (niche, 1K–100K; no generic communities)
 - EXACTLY 3 cross-promo matches (complementary shows, similar audience size)
 - All data must be transcript-grounded
-- For each keyword/topic set, include 1 **primary intent term** + 3–5 **semantic neighbors**
-- Each \`community_suggestions\` item MUST include \`first_post\` (≤220 chars, value-first, no link)
-- Each \`cross_promo_matches\` item MUST include \`outreach_dm\` (≤420 chars, friendly, specific swap ask)
+- For each keyword/topic set, include 1 primary intent term + 3–5 semantic neighbors
+- Each community_suggestions item MUST include first_post (≤220 chars, value-first, no link)
+- Each cross_promo_matches item MUST include outreach_dm (≤420 chars, friendly, specific swap ask)
+
+Section 3.1: Quote Extraction & Scoring (INTERNAL)
+Before producing final tweetable_quotes:
+- Extract 8–12 candidate quotes from transcript (<=240 chars each).
+- For each, compute scores: insight(0–5), emotion(0–5), clarity(0–5), novelty(0–5), virality(0–5).
+- Add 1–2 smart hashtags from the keyword plan (primary intent + semantic neighbors).
+- Select top 3 (highest total) respecting 280-char limit. Use those as tweetable_quotes.
+- Also include quotes_candidates_debug (array of objects: {text, hashtags, scores:{...}, score}) for QA.
 
 Section 4: JSON Output Format 📋 CORE STRUCTURE
 Return only valid JSON (no prose). Do not include keys not listed below.
 
 {
-  "episode_summary": "2–3 engaging sentences that convey the guest/topic’s core promise and listener outcome.",
-  "tweetable_quotes": [
-    "Exact quote #1 from transcript...",
-    "Exact quote #2 from transcript...",
-    "Exact quote #3 from transcript..."
-  ],
+  "episode_summary": "2–3 sentences in the guest/show’s voice describing core promise and listener outcome.",
+  "tweetable_quotes": ["Quote 1 with 1–2 hashtags", "Quote 2 with hashtags", "Quote 3 with hashtags"],
   "topics_keywords": [
-    {
-      "primary_intent": "Main searchable term from transcript",
-      "semantic_neighbors": ["related term 1", "related term 2", "related term 3", "related term 4", "related term 5"]
-    },
+    { "primary_intent": "Main searchable term", "semantic_neighbors": ["rel1","rel2","rel3","rel4","rel5"] },
     { "primary_intent": "...", "semantic_neighbors": ["..."] },
     { "primary_intent": "...", "semantic_neighbors": ["..."] }
   ],
-  "optimized_title": "SEO-optimized title (≤70 chars, contains 1 primary intent term)",
-  "optimized_description": "150–200 words, includes at least 3 primary intents and 3–5 semantic neighbors woven naturally, with a single CTA to play.",
+  "optimized_title": "≤70 chars; must contain one primary intent term; keep episode voice.",
+  "optimized_description": "150–200 words; weave ≥3 primary intents + 3–5 neighbors; single CTA.",
   "community_suggestions": [
-    {
-      "name": "Niche community (1K–100K)",
-      "platform": "Platform name",
-      "url": "Direct URL",
-      "member_size": "Approx count",
-      "why": "Specific problem this episode addresses for this community",
-      "post_angle": "Conversation-first hook",
-      "engagement_strategy": "Platform-native tactic + timing",
-      "conversion_potential": "Why they are likely to click play",
-      "first_post": "Copy-paste, ≤220 chars, includes 1 transcript phrase",
-      "confidence": "high|medium"
-    },
-    { "name": "...", "platform": "...", "url": "...", "member_size": "...", "why": "...", "post_angle": "...", "engagement_strategy": "...", "conversion_potential": "...", "first_post": "...", "confidence": "..." },
-    { "name": "...", "platform": "...", "url": "...", "member_size": "...", "why": "...", "post_angle": "...", "engagement_strategy": "...", "conversion_potential": "...", "first_post": "...", "confidence": "..." }
+    {"name":"...","platform":"...","url":"...","member_size":"...","why":"...","post_angle":"...","engagement_strategy":"...","conversion_potential":"...","first_post":"<=220 chars, includes 1 transcript phrase","confidence":"high|medium"},
+    {"name":"...","platform":"...","url":"...","member_size":"...","why":"...","post_angle":"...","engagement_strategy":"...","conversion_potential":"...","first_post":"...","confidence":"..."},
+    {"name":"...","platform":"...","url":"...","member_size":"...","why":"...","post_angle":"...","engagement_strategy":"...","conversion_potential":"...","first_post":"...","confidence":"..."}
   ],
   "cross_promo_matches": [
-    {
-      "podcast_name": "Complementary podcast",
-      "why_match": "Fit grounded in transcript themes",
-      "audience_overlap": "Estimated %",
-      "collaboration_value": "Swap angle (promo, feed drop, clip trade)",
-      "outreach_timing": "Best window (day/time)",
-      "outreach_dm": "Copy-paste DM, ≤420 chars, includes 1 transcript phrase",
-      "confidence": "high|medium"
-    },
-    { "podcast_name": "...", "why_match": "...", "audience_overlap": "...", "collaboration_value": "...", "outreach_timing": "...", "outreach_dm": "...", "confidence": "..." },
-    { "podcast_name": "...", "why_match": "...", "audience_overlap": "...", "collaboration_value": "...", "outreach_timing": "...", "outreach_dm": "...", "confidence": "..." }
+    {"podcast_name":"...","why_match":"...","audience_overlap":"...","collaboration_value":"...","outreach_timing":"...","outreach_dm":"<=420 chars, includes 1 transcript phrase","confidence":"high|medium"},
+    {"podcast_name":"...","why_match":"...","audience_overlap":"...","collaboration_value":"...","outreach_timing":"...","outreach_dm":"...","confidence":"..."},
+    {"podcast_name":"...","why_match":"...","audience_overlap":"...","collaboration_value":"...","outreach_timing":"...","outreach_dm":"...","confidence":"..."}
   ],
-  "trend_piggyback": "One current, durable conversation to join; specify angle and why it fits.",
-  "social_caption": "1–2 punchy sentences tailored to platform; includes 1 primary intent and 1 semantic neighbor.",
+  "trend_piggyback": "One durable conversation; specify angle + why it fits.",
+  "social_caption": "1–2 platform-native sentences; include 1 primary intent + 1 neighbor.",
   "next_step": "One concrete action a solo creator can do in ≤20 minutes.",
-  "growth_score": "0–100 (rubric-based)"
+  "growth_score": "0–100 (rubric-based)",
+  "quotes_candidates_debug": [{"text":"...","hashtags":["#x","#y"],"scores":{"insight":5,"emotion":4,"clarity":5,"novelty":4,"virality":5},"score":23}]
 }
 
 Section 5: Business Objective
-**OBJECTIVE:**
-Give overwhelmed independent podcasters step-by-step, immediately actionable ways to get more plays per episode without a marketing team or technical expertise.
+**OBJECTIVE:** Help solo podcasters get more plays per episode with immediately actionable steps.
 
 Section 6: Perspective/Voice
-**PERSPECTIVE:**
-Supportive growth partner. Clear, kind, practical. Avoid generic marketing clichés. Use platform-native, action-driven language.
+**PERSPECTIVE:** Supportive, clear, practical; match the episode’s tone/voice.
 
-Section 7: Methodology 🧠 YOUR SECRET SAUCE
-**PROPRIETARY SEMANTIC ANALYSIS METHODOLOGY:**
-1) **Transcript Foundation** — Parse exact phrases, entities, claims, and emotional tone to extract problem statements, promised outcomes, and repeatable listener-search language.
-2) **Semantic Expansion** — For each core theme, identify the **primary intent term** and 3–5 **semantic neighbors**.
-3) **Conversation Insertion** — Locate active topic clusters where these terms appear in ongoing discussions.
-4) **Niche Community Discovery** — Prefer 1K–100K member spaces with active, recent threads; score by topical fit and engagement depth.
-5) **Copy Calibration** — Weave primary + neighbor terms into titles/descriptions/captions.
-6) **Action Readiness** — Generate \`first_post\` and \`outreach_dm\` fields so creators can take action in under 1 minute.
-7) **Effort/Impact Awareness** — Prioritize quick, high-leverage solo tactics.
+Section 7: Methodology 🧠
+1) Transcript Foundation → 2) Semantic Expansion → 3) Conversation Insertion → 4) Niche Discovery
+→ 5) Copy Calibration → 6) Action Readiness → 7) Effort/Impact Awareness
 
 Section 7.1: Voice Profile (Derive From Transcript)
-Extract a voice profile (tone, rhythm, formality, energy). Use it consistently in title, description, captions, first_post, outreach_dm.
+Use this voice consistently in title, description, captions, first_post, outreach_dm.
 
-Section 8: Context Variables
-**EPISODE INFORMATION:**
+Section 8: Context
 Episode Title: ${episodeTitle || 'New Episode'}
 Podcast: ${podcastTitle || 'Podcast Growth Analysis'}
 
-**TRANSCRIPT:**
+TRANSCRIPT:
 ${safeTranscript}
 
-Section 9: Community Examples 🎯 GUIDANCE SYSTEM
-**COMMUNITY TARGETING EXAMPLES:**
-- Wellness: mindfulness habit groups (50K–90K), sleep optimization circles (10K–40K)
-- Business: SaaS founder micro-forums (5K–30K), niche indie-hacker threads (20K–80K)
-- Creative: discipline-specific craft groups (15K–70K)
+Section 9: Community Examples
+- Wellness: mindfulness habit groups, sleep optimization circles
+- Business: SaaS founder micro-forums, indie-hacker threads
+- Creative: discipline-specific craft groups
 
 Section 10: Final Enforcement
-**IMPORTANT:**
 - No generic podcast communities
-- Use only transcript-relevant niche communities
 - Arrays = exactly 3 items
-- Output = only the JSON described above
+- Output = exactly the JSON structure above
 `;
 }
 
@@ -622,9 +588,9 @@ function createFallbackAnalysis(transcript, episodeTitle) {
   return {
     episode_summary: "Episode transcribed. Advanced analysis temporarily unavailable (fallback).",
     tweetable_quotes: [
-      `🎙️ New episode: "${episodeTitle}" — big insights inside!`,
-      "📈 Every episode is a chance to earn a new listener.",
-      "🚀 Consistency compounds your podcast growth."
+      `🎙️ New episode: "${episodeTitle}" — big insights inside! #podcast`,
+      "📈 Every episode is a chance to earn a new listener. #podcastgrowth",
+      "🚀 Consistency compounds your podcast growth. #creatoreconomy"
     ],
     topics_keywords: ["podcast", "growth", "strategy", "audience", "content"],
     optimized_title: episodeTitle || "Optimize this title for SEO",
