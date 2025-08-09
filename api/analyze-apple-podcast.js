@@ -1,6 +1,10 @@
 // api/analyze-apple-podcast.js
 // Apple Podcasts URL → metadata → /tmp download (retries/timeouts) → upload to Vercel Blob →
 // -> CHUNKED Groq Whisper transcription (Range-based) → Enhanced TROOP (JSON-forced + distilled fallback)
+// Improvements:
+// - Prompt: voice profile + explicit dependency on primary/neighbor keywords across outputs
+// - Output: keep keyword objects AND auto-create flat topics_keywords list for compatibility
+// - Groq: retry on 5xx within each chunk
 
 import { setCorsHeaders } from '../lib/cors.js';
 import { put } from '@vercel/blob';
@@ -25,6 +29,8 @@ const APP_CONFIG = {
   MAX_RETRIES: 2,
   MAX_CHUNK_BYTES: Number(process.env.MAX_CHUNK_MB || 18) * 1024 * 1024, // default 18MB
   MIN_CHUNK_BYTES: 8 * 1024 * 1024, // 8MB floor
+  GROQ_RETRY_COUNT: 2,
+  GROQ_RETRY_DELAY_MS: 800,
 };
 
 export default async function handler(req, res) {
@@ -86,7 +92,22 @@ export default async function handler(req, res) {
     debug.push(`✅ Transcribed (${transcription.transcript.length} chars) via ${transcription.chunks} chunk(s)`);
 
     debug.push('🧠 Running Enhanced TROOP analysis…');
-    const analysis = await analyzeWithTROOP(transcription.transcript, episodeTitle, podcastTitle);
+    let analysis = await analyzeWithTROOP(transcription.transcript, episodeTitle, podcastTitle);
+
+    // ---- POST-PROCESS: keep object plan, also produce flat topics_keywords for compatibility/use downstream
+    if (Array.isArray(analysis?.topics_keywords) && typeof analysis.topics_keywords[0] === 'object') {
+      const plan = analysis.topics_keywords;
+      analysis.keyword_plan = plan; // keep rich objects
+      const flat = [];
+      for (const k of plan) {
+        if (k?.primary_intent) flat.push(String(k.primary_intent));
+        if (Array.isArray(k?.semantic_neighbors)) {
+          for (const n of k.semantic_neighbors) flat.push(String(n));
+        }
+      }
+      analysis.topics_keywords = Array.from(new Set(flat)).slice(0, 15); // cap a bit
+    }
+
     debug.push('✅ TROOP analysis complete');
 
     const processingTime = Date.now() - startTime;
@@ -104,7 +125,7 @@ export default async function handler(req, res) {
         transcriptionSource: transcription.metrics.source,
         processing_time_ms: processingTime,
         processed_at: new Date().toISOString(),
-        api_version: '5.2-apple-url-blob-chunked',
+        api_version: '5.3-apple-url-blob-chunked',
         blob_url: blob.url,
       },
       transcript: transcription.transcript,
@@ -165,9 +186,6 @@ function pickAudioUrl(meta) {
 
 function extractBasicMetadataFromUrl(appleUrl) {
   const parts = appleUrl.split('/');
-  theTitle: {
-    // keep it simple; best-effort title from URL
-  }
   const titlePart = parts.find((p) => p.includes('-') && !p.includes('id'));
   const title = titlePart
     ? titlePart.replace(/-/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase())
@@ -283,6 +301,25 @@ async function transcribeWithGroqFromBlobChunked(blobUrl, filename, debug = []) 
         debug.push(`↘️ 413 from Groq, reducing chunk size to ~${Math.round(chunkSize / 1024 / 1024)}MB and retrying`);
         continue;
       }
+      // retry 5xx for the same chunk
+      if (/(500|502|503|504)/.test(msg)) {
+        let retried = false;
+        for (let i = 0; i < APP_CONFIG.GROQ_RETRY_COUNT; i++) {
+          await new Promise(r => setTimeout(r, APP_CONFIG.GROQ_RETRY_DELAY_MS * (i + 1)));
+          try {
+            const tr2 = await groqOnce(buf, `${filename}.part${part}.mp3`);
+            parts.push(tr2.transcript);
+            debug.push(`🔁 Groq 5xx recovered on retry ${i + 1} for chunk ${part}`);
+            offset = end + 1;
+            part += 1;
+            retried = true;
+            break;
+          } catch (e2) {
+            if (i === APP_CONFIG.GROQ_RETRY_COUNT - 1) throw e2;
+          }
+        }
+        if (retried) continue;
+      }
       throw e;
     }
   }
@@ -340,7 +377,7 @@ async function analyzeWithTROOP(transcript, episodeTitle = '', podcastTitle = ''
     'Arrays MUST contain exactly 3 items for tweetable_quotes, community_suggestions, cross_promo_matches.',
     'Each community_suggestions item MUST include first_post (<=220 chars).',
     'Each cross_promo_matches item MUST include outreach_dm (<=420 chars).',
-    'Focus strictly on marketing/SEO/community growth; no medical or sensitive guidance.'
+    'Maintain the episode’s tone/voice consistently across title, description, captions, posts, and DMs.'
   ].join(' ');
 
   const enhancedTROOPPrompt = buildTroopPrompt(transcript, episodeTitle, podcastTitle);
@@ -356,7 +393,7 @@ async function analyzeWithTROOP(transcript, episodeTitle = '', podcastTitle = ''
       body: JSON.stringify({
         model: APP_CONFIG.OPENAI.ANALYSIS_MODEL,
         response_format: { type: 'json_object' },
-        temperature: 0.7,
+        temperature: 0.75,
         max_tokens: 4000,
         messages: [
           { role: 'system', content: baseSystem },
@@ -441,7 +478,7 @@ Section 3: Critical Requirements ⚠️ ENFORCEMENT LAYER
 - EXACTLY 3 community suggestions (niche, 1K–100K members; no generic communities like r/podcasts)
 - EXACTLY 3 cross-promo matches (complementary shows, similar audience size)
 - All data must be transcript-grounded
-- For each keyword/topic set, include 1 **primary intent term** + 3–5 **semantic neighbors** (conceptually related terms)
+- For each keyword/topic set, include 1 **primary intent term** + 3–5 **semantic neighbors**
 - Each \`community_suggestions\` item MUST include \`first_post\` (≤220 chars, value-first, no link)
 - Each \`cross_promo_matches\` item MUST include \`outreach_dm\` (≤420 chars, friendly, specific swap ask)
 
@@ -511,12 +548,15 @@ Supportive growth partner. Clear, kind, practical. Avoid generic marketing clich
 Section 7: Methodology 🧠 YOUR SECRET SAUCE
 **PROPRIETARY SEMANTIC ANALYSIS METHODOLOGY:**
 1) **Transcript Foundation** — Parse exact phrases, entities, claims, and emotional tone to extract problem statements, promised outcomes, and repeatable listener-search language.
-2) **Semantic Expansion** — For each core theme, identify the **primary intent term** and 3–5 **semantic neighbors** using conceptual similarity, topical adjacency, and audience-relevant variations (similar to Google Broad Match principles).
-3) **Conversation Insertion** — Apply the “birds of a feather” rule: locate active topic clusters where these terms appear in ongoing discussions.
-4) **Niche Community Discovery** — Prefer 1K–100K member spaces with active, recent discussion threads. Score by topical fit and engagement depth.
-5) **Copy Calibration** — Weave primary + neighbor terms into titles, descriptions, captions for expanded surface area without losing authenticity.
+2) **Semantic Expansion** — For each core theme, identify the **primary intent term** and 3–5 **semantic neighbors**.
+3) **Conversation Insertion** — Locate active topic clusters where these terms appear in ongoing discussions.
+4) **Niche Community Discovery** — Prefer 1K–100K member spaces with active, recent threads; score by topical fit and engagement depth.
+5) **Copy Calibration** — Weave primary + neighbor terms into titles/descriptions/captions.
 6) **Action Readiness** — Generate \`first_post\` and \`outreach_dm\` fields so creators can take action in under 1 minute.
-7) **Effort/Impact Awareness** — Prioritize tactics solo creators can execute quickly.
+7) **Effort/Impact Awareness** — Prioritize quick, high-leverage solo tactics.
+
+Section 7.1: Voice Profile (Derive From Transcript)
+Extract a voice profile (tone, rhythm, formality, energy). Use it consistently in title, description, captions, first_post, outreach_dm.
 
 Section 8: Context Variables
 **EPISODE INFORMATION:**
