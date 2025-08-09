@@ -1,17 +1,15 @@
 // api/analyze-apple-podcast.js
-// Apple Podcasts URL → metadata → stream MP3 → Vercel Blob (public) → Groq Whisper
-// If file too large (or Groq returns 413) → fallback to podcast-api-amber with the Blob URL
-// Includes hardened TROOP JSON parsing.
+// Apple Podcasts URL → metadata → /tmp download (retries/timeouts) → upload to Vercel Blob → Groq Whisper → Enhanced TROOP (JSON-forced + distilled fallback)
 
 import { setCorsHeaders } from '../lib/cors.js';
+import { put } from '@vercel/blob';
 import FormData from 'form-data';
 import fs from 'fs';
 import path from 'path';
 import { pipeline } from 'stream/promises';
-import { put } from '@vercel/blob';
 
 const APP_CONFIG = {
-  METADATA_URL: 'https://podcast-api-amber.vercel.app/api/transcribe', // supports metadataOnly + full transcription
+  METADATA_URL: 'https://podcast-api-amber.vercel.app/api/transcribe', // metadataOnly=true
   GROQ: {
     API_URL: 'https://api.groq.com/openai/v1/audio/transcriptions',
     MODEL: 'whisper-large-v3-turbo',
@@ -21,9 +19,9 @@ const APP_CONFIG = {
     CHAT_URL: 'https://api.openai.com/v1/chat/completions',
     ANALYSIS_MODEL: 'gpt-4o-mini',
   },
-  HARD_SIZE_LIMIT_BYTES: 1024 * 1024 * 300, // 300MB hard stop
-  GROQ_SOFT_LIMIT_BYTES: 24 * 1024 * 1024,  // ~24MB → use helper for larger files
-  BLOB_ACCESS: 'public',
+  HARD_SIZE_LIMIT_BYTES: 1024 * 1024 * 300, // 300MB hard cap
+  FETCH_TIMEOUT_MS: 60_000,
+  MAX_RETRIES: 2,
 };
 
 export default async function handler(req, res) {
@@ -31,341 +29,453 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const started = Date.now();
+  const startTime = Date.now();
   const debug = [];
 
   try {
+    // ---- Sanity checks
+    if (!process.env.BLOB_READ_WRITE_TOKEN) {
+      return res.status(500).json({ error: 'Server misconfig: BLOB_READ_WRITE_TOKEN not set' });
+    }
+    if (!process.env.GROQ_API_KEY) {
+      return res.status(500).json({ error: 'Server misconfig: GROQ_API_KEY not set' });
+    }
+
+    // ---- Parse body
     const { appleUrl, title } = await readJsonBody(req);
     if (!appleUrl) return res.status(400).json({ error: 'Apple Podcast URL is required' });
 
-    debug.push(`🚀 Start Apple URL flow: ${appleUrl}`);
+    debug.push(`🚀 Apple analysis start: ${appleUrl}`);
+    debug.push('📞 Fetching metadata (fast)…');
 
-    // 1) Metadata
+    // ---- 1) Episode metadata
     const meta = await getEpisodeMetadata(appleUrl, debug);
     const episodeTitle = meta.title || title || 'Episode';
     const podcastTitle = meta.podcast_title || meta.podcastTitle || 'Podcast';
     const audioUrl = pickAudioUrl(meta);
-    if (!audioUrl) return res.status(400).json({ error: 'No audio URL found in episode metadata.', debug });
-    debug.push(`🎵 MP3 source: ${String(audioUrl).slice(0, 140)}…`);
+    if (!audioUrl) {
+      return res.status(400).json({ error: 'No audio URL found in metadata', debug });
+    }
+    debug.push(`🎵 Audio URL found: ${String(audioUrl).slice(0, 140)}…`);
 
-    // 2) HEAD size gate
-    const { contentLength } = await headInfo(audioUrl);
+    // ---- 2) HEAD check (guard absurd sizes)
+    debug.push('🧪 HEAD check…');
+    const { contentLength, contentType } = await headInfo(audioUrl);
     if (contentLength && contentLength > APP_CONFIG.HARD_SIZE_LIMIT_BYTES) {
-      return res.status(413).json({ error: `Audio too large (${Math.round(contentLength/1024/1024)}MB)`, debug });
+      return res.status(413).json({
+        error: `Audio too large (${Math.round(contentLength / 1024 / 1024)}MB). Use the MP3 upload path.`,
+        debug,
+      });
     }
 
-    // 3) Download → /tmp
-    debug.push('📥 Downloading to /tmp…');
-    const tmpInfo = await downloadAudioToTmp(audioUrl);
-    debug.push(`📁 /tmp size ≈ ${Math.round(tmpInfo.sizeBytes/1024/1024)}MB`);
+    // ---- 3) Download to /tmp with retries + timeout
+    debug.push('📥 Downloading MP3 → /tmp (stream) with retries…');
+    const tmpInfo = await downloadToTmpWithRetries(
+      audioUrl,
+      APP_CONFIG.MAX_RETRIES,
+      APP_CONFIG.FETCH_TIMEOUT_MS
+    );
+    debug.push(`📁 Saved to /tmp (${Math.round(tmpInfo.sizeBytes / 1024 / 1024)}MB)`);
 
-    // 4) Upload /tmp → Blob (public) (we’ll use this for the 413 fallback path)
-    debug.push('🫧 Uploading to Vercel Blob…');
-    const blobUrl = await uploadTmpToBlob(tmpInfo.tmpPath, `${safeSlug(episodeTitle)}.mp3`);
-    debug.push(`🫧 Blob URL: ${blobUrl}`);
+    // ---- 4) Upload /tmp to Vercel Blob (public)
+    const fileExt = guessExtension(contentType) || '.mp3';
+    const blobFilename = safeName(`${episodeTitle}`) + fileExt;
 
-    // 5) Transcribe (Groq if small; else helper)
-    let transcription;
-    const shouldUseHelper = tmpInfo.sizeBytes > APP_CONFIG.GROQ_SOFT_LIMIT_BYTES;
+    debug.push('☁️ Uploading to Vercel Blob…');
+    const blob = await put(blobFilename, fs.createReadStream(tmpInfo.tmpPath), {
+      access: 'public',
+      addRandomSuffix: true,
+      contentType: contentType || 'audio/mpeg',
+    });
+    debug.push(`✅ Blob uploaded: ${blob.url}`);
 
-    if (shouldUseHelper) {
-      debug.push('📏 Large file → using helper service for transcription');
-      transcription = await transcribeViaHelper(blobUrl, episodeTitle, debug);
-    } else {
-      try {
-        debug.push('⚡ Transcribing with Groq (direct upload)…');
-        transcription = await transcribeWithGroqFromTmp(tmpInfo.tmpPath, episodeTitle);
-      } catch (e) {
-        const msg = String(e?.message || e);
-        if (/413/.test(msg) || /too large/i.test(msg)) {
-          debug.push(`🛟 Groq 413 → fallback to helper with Blob URL`);
-          transcription = await transcribeViaHelper(blobUrl, episodeTitle, debug);
-        } else {
-          throw e;
-        }
-      }
-    }
+    // ---- 5) Download from Blob → Buffer → Groq Whisper (matches your working blob path)
+    debug.push('⚡ Transcribing with Groq Whisper from Blob…');
+    const transcription = await transcribeWithGroqFromBlob(blob.url, blobFilename);
+    debug.push(`✅ Transcribed (${transcription.transcript.length} chars)`);
 
-    debug.push(`✅ Transcript chars: ${transcription.transcript.length}`);
-
-    // 6) Enhanced TROOP (hardened JSON)
-    debug.push('🧠 Running Enhanced TROOP…');
-    const analysis = await analyzeWithEnhancedTROOP(
+    // ---- 6) Enhanced TROOP (superior prompt) with fallback
+    debug.push('🧠 Running Enhanced TROOP analysis…');
+    const analysis = await analyzeWithTROOP(
       transcription.transcript,
       episodeTitle,
-      podcastTitle,
-      debug
+      podcastTitle
     );
-    debug.push('✅ TROOP complete');
+    debug.push('✅ TROOP analysis complete');
+
+    const processingTime = Date.now() - startTime;
 
     return res.status(200).json({
       success: true,
-      source: shouldUseHelper ? 'Apple URL → Blob → Helper → TROOP' : 'Apple URL → Blob → Groq → TROOP',
+      source: 'Apple URL → /tmp → Vercel Blob → Groq Whisper → Enhanced TROOP',
       metadata: {
         title: episodeTitle,
         podcastTitle,
         originalUrl: appleUrl,
         audioUrl,
-        blobUrl,
+        description: meta.description,
         duration: meta.duration || transcription.metrics.durationSeconds,
+        keywords: meta.keywords || [],
         transcriptionSource: transcription.metrics.source,
-        audio_metrics: transcription.metrics,
-        processing_time_ms: Date.now() - started,
+        processing_time_ms: processingTime,
         processed_at: new Date().toISOString(),
-        api_version: '4.4-apple-blob-groq-or-helper',
+        api_version: '5.0-apple-url-blob-troop',
+        blob_url: blob.url,
       },
       transcript: transcription.transcript,
-      description: meta.description,
-      keywords: meta.keywords || [],
       analysis,
       debug,
     });
   } catch (err) {
+    const processingTime = Date.now() - startTime;
     return res.status(500).json({
       error: 'Analysis failed',
-      details: String(err?.message || err),
-      processing_time_ms: Date.now() - started,
+      details: String(err.message || err),
+      processing_time_ms: processingTime,
     });
+  } finally {
+    // /tmp cleanup is done inside the download/transcribe functions
   }
 }
 
 /* ---------------------------
-   Helpers: request + metadata
+   Helpers
 ----------------------------*/
+
 async function readJsonBody(req) {
   const chunks = [];
   for await (const c of req) chunks.push(c);
   const raw = Buffer.concat(chunks).toString('utf8') || '{}';
   return JSON.parse(raw);
 }
+
 async function getEpisodeMetadata(appleUrl, debug) {
   const { default: fetch } = await import('node-fetch');
-  const r = await fetch(APP_CONFIG.METADATA_URL, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url: appleUrl, metadataOnly: true }),
-  });
-  if (!r.ok) { debug.push('⚠️ Metadata helper unavailable; fallback to URL parse'); return extractBasicMetadataFromUrl(appleUrl); }
-  const text = await r.text();
-  const lines = text.trim().split('\n').filter(Boolean);
-  for (const line of lines.reverse()) {
-    try { const j = JSON.parse(line); if (j.status === 'success' || j.title) return j; } catch {}
+  try {
+    const r = await fetch(APP_CONFIG.METADATA_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: appleUrl, metadataOnly: true }),
+      signal: AbortSignal.timeout(APP_CONFIG.FETCH_TIMEOUT_MS),
+    });
+    if (!r.ok) throw new Error(`Metadata ${r.status}`);
+    const text = await r.text();
+    const lines = text.trim().split('\n').filter(Boolean);
+    for (const line of lines.reverse()) {
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed.status === 'success' || parsed.title) return parsed;
+      } catch {}
+    }
+    throw new Error('No metadata lines parsed');
+  } catch (e) {
+    debug.push(`⚠️ Metadata fallback: ${e.message}`);
+    return extractBasicMetadataFromUrl(appleUrl);
   }
-  return extractBasicMetadataFromUrl(appleUrl);
 }
+
 function pickAudioUrl(meta) {
   return meta.audio_url || meta.audioUrl || meta.enclosure_url || meta.mp3_url || null;
 }
+
 function extractBasicMetadataFromUrl(appleUrl) {
   const parts = appleUrl.split('/');
   const titlePart = parts.find((p) => p.includes('-') && !p.includes('id'));
-  const title = titlePart ? titlePart.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase()) : 'Episode';
-  return { title, podcast_title: 'Podcast', description: 'Episode analysis', duration: 0 };
+  const title = titlePart
+    ? titlePart.replace(/-/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase())
+    : 'Episode';
+  return {
+    title,
+    podcast_title: 'Podcast',
+    description: 'Episode analysis from Apple Podcast URL',
+    duration: 0,
+  };
 }
+
 async function headInfo(url) {
   const { default: fetch } = await import('node-fetch');
   try {
-    const r = await fetch(url, { method: 'HEAD', redirect: 'follow' });
+    const r = await fetch(url, { method: 'HEAD', redirect: 'follow', signal: AbortSignal.timeout(15_000) });
     if (!r.ok) return { contentLength: 0, contentType: '' };
-    return { contentLength: Number(r.headers.get('content-length') || 0), contentType: r.headers.get('content-type') || '' };
-  } catch { return { contentLength: 0, contentType: '' }; }
+    return {
+      contentLength: Number(r.headers.get('content-length') || 0),
+      contentType: r.headers.get('content-type') || '',
+    };
+  } catch {
+    // some hosts block HEAD
+    return { contentLength: 0, contentType: '' };
+  }
 }
 
-/* ---------------------------
-   Download → /tmp
-----------------------------*/
-async function downloadAudioToTmp(audioUrl) {
+async function downloadToTmpWithRetries(audioUrl, maxRetries, timeoutMs) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    try {
+      return await downloadAudioToTmp(audioUrl, timeoutMs);
+    } catch (e) {
+      lastErr = e;
+      if (attempt <= maxRetries) await new Promise(r => setTimeout(r, 600 * attempt));
+    }
+  }
+  throw lastErr;
+}
+
+async function downloadAudioToTmp(audioUrl, timeoutMs) {
   const { default: fetch } = await import('node-fetch');
-  const res = await fetch(audioUrl, { redirect: 'follow' });
-  if (!res.ok || !res.body) throw new Error(`Failed to download audio: ${res.status} ${res.statusText}`);
+  const res = await fetch(audioUrl, { redirect: 'follow', signal: AbortSignal.timeout(timeoutMs) });
+  if (!res.ok || !res.body) throw new Error(`Download failed ${res.status} ${res.statusText}`);
+
   const tmpPath = path.join('/tmp', `episode-${Date.now()}.mp3`);
   await pipeline(res.body, fs.createWriteStream(tmpPath));
   const stat = fs.statSync(tmpPath);
-  if (!stat.size || stat.size < 1024) { try { fs.unlinkSync(tmpPath); } catch {} throw new Error('Downloaded audio appears empty'); }
+  if (!stat.size || stat.size < 1024) {
+    try { fs.unlinkSync(tmpPath); } catch {}
+    throw new Error('Downloaded audio empty/truncated');
+  }
   return { tmpPath, sizeBytes: stat.size };
 }
 
-/* ---------------------------
-   Blob upload
-----------------------------*/
-async function uploadTmpToBlob(tmpPath, filename) {
-  const fileBuffer = fs.readFileSync(tmpPath);
-  const { url } = await put(filename, fileBuffer, {
-    access: APP_CONFIG.BLOB_ACCESS,
-    contentType: 'audio/mpeg',
-    addRandomSuffix: true,
-  });
-  return url;
-}
-function safeSlug(s) {
-  return String(s || 'episode').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+function guessExtension(contentType) {
+  if (!contentType) return '.mp3';
+  if (contentType.includes('mpeg')) return '.mp3';
+  if (contentType.includes('x-m4a') || contentType.includes('mp4') || contentType.includes('aac')) return '.m4a';
+  if (contentType.includes('wav')) return '.wav';
+  return '.mp3';
 }
 
-/* ---------------------------
-   Transcription: Groq
-----------------------------*/
-async function transcribeWithGroqFromTmp(tmpPath, filenameBase = 'Episode') {
-  const groqApiKey = process.env.GROQ_API_KEY;
-  if (!groqApiKey) throw new Error('Groq API key not configured');
+function safeName(s) {
+  return (s || 'episode').replace(/[^a-z0-9\-_]+/gi, '-').slice(0, 80);
+}
 
+async function transcribeWithGroqFromBlob(blobUrl, filename) {
   const { default: fetch } = await import('node-fetch');
+  const groqApiKey = process.env.GROQ_API_KEY;
+
+  // Download from blob
+  const fileRes = await fetch(blobUrl);
+  if (!fileRes.ok) throw new Error(`Blob download failed: ${fileRes.status} ${fileRes.statusText}`);
+  const arr = await fileRes.arrayBuffer();
+  const fileBuffer = Buffer.from(arr);
+
+  // Send to Groq
   const formData = new FormData();
-  formData.append('file', fs.createReadStream(tmpPath), { filename: `${filenameBase}.mp3`, contentType: 'audio/mpeg' });
+  formData.append('file', fileBuffer, { filename, contentType: 'audio/mpeg' });
   formData.append('model', APP_CONFIG.GROQ.MODEL);
   formData.append('response_format', APP_CONFIG.GROQ.RESPONSE_FORMAT);
 
-  try {
-    const response = await fetch(APP_CONFIG.GROQ.API_URL, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${groqApiKey}`, ...formData.getHeaders() },
-      body: formData,
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => '');
-      throw new Error(`Groq API error: ${response.status} ${errorText}`);
-    }
-
-    const transcript = await response.text();
-    const durationEstimate = transcript.length / 8;
-    return {
-      transcript,
-      metrics: {
-        durationSeconds: Math.round(durationEstimate),
-        durationMinutes: Math.round(durationEstimate / 60),
-        confidence: 'estimated',
-        source: 'groq',
-      },
-    };
-  } finally {
-    try { fs.unlinkSync(tmpPath); } catch {}
-  }
-}
-
-/* ---------------------------
-   Transcription: Helper fallback (Blob URL)
-----------------------------*/
-async function transcribeViaHelper(blobUrl, episodeTitle, debug) {
-  const { default: fetch } = await import('node-fetch');
-  const r = await fetch(APP_CONFIG.METADATA_URL, {
+  const resp = await fetch(APP_CONFIG.GROQ.API_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    // Tell helper to transcribe from blob URL (NOT metadataOnly)
-    body: JSON.stringify({ url: blobUrl, metadataOnly: false }),
+    headers: { Authorization: `Bearer ${groqApiKey}`, ...formData.getHeaders() },
+    body: formData,
+    // Groq handles large multipart uploads; if any 413 persists we’ll handle at call site
   });
 
-  const text = await r.text();
-  if (!r.ok) throw new Error(`Helper transcription failed: ${r.status} ${text.slice(0, 300)}`);
-
-  // helper returns NDJSON; find last valid JSON with transcript
-  const lines = text.trim().split('\n').filter(Boolean);
-  let payload = {};
-  for (const line of lines.reverse()) {
-    try { payload = JSON.parse(line); if (payload.transcript) break; } catch {}
+  if (!resp.ok) {
+    const errorText = await resp.text().catch(() => '');
+    throw new Error(`Groq API error: ${resp.status} ${errorText}`);
   }
-  if (!payload.transcript) throw new Error(`Helper transcription missing transcript: ${text.slice(0, 300)}`);
 
-  const transcript = payload.transcript;
+  const transcript = await resp.text();
   const durationEstimate = transcript.length / 8;
-  debug.push('✅ Helper transcription complete');
-
   return {
     transcript,
     metrics: {
       durationSeconds: Math.round(durationEstimate),
       durationMinutes: Math.round(durationEstimate / 60),
       confidence: 'estimated',
-      source: 'helper',
+      source: 'groq',
     },
   };
 }
 
-/* ---------------------------
-   TROOP (hardened JSON)
-----------------------------*/
-function stripCodeFences(s){if(!s)return s;return s.replace(/^```json\s*/i,'').replace(/^```\s*/i,'').replace(/```$/i,'').trim();}
-function extractJsonObject(text){
-  if(!text) throw new Error('Empty model response');
-  try { return JSON.parse(text); } catch {}
-  const unfenced = stripCodeFences(text);
-  try { return JSON.parse(unfenced); } catch {}
-  let start=-1, depth=0;
-  for(let i=0;i<unfenced.length;i++){
-    const ch=unfenced[i];
-    if(ch==='{'){ if(depth===0) start=i; depth++; }
-    else if(ch==='}'){ depth--; if(depth===0 && start!==-1){ const c=unfenced.slice(start,i+1); try{ return JSON.parse(c);}catch{}}}
-  }
-  throw new Error('Could not extract valid JSON from model output');
-}
-async function analyzeWithEnhancedTROOP(transcript, episodeTitle='', podcastTitle='', debugArr=[]){
+/* ---------- Enhanced TROOP (superior prompt, JSON-forced + distilled fallback) ---------- */
+
+async function analyzeWithTROOP(transcript, episodeTitle = '', podcastTitle = '') {
   const openaiApiKey = process.env.OPENAI_API_KEY;
   if (!openaiApiKey) return createFallbackAnalysis(transcript, episodeTitle);
+
   const baseSystem = [
     'You are Podcast Growth Agent.',
     'Respond with valid JSON only. No markdown, no code fences, no commentary.',
-    'Do NOT provide medical advice; focus on marketing, SEO, audience targeting, and community strategy.',
+    'Do NOT provide medical advice; focus on marketing/SEO/community.',
     'Arrays MUST contain exactly 3 items for tweetable_quotes, community_suggestions, and cross_promo_matches.'
   ].join(' ');
-  const prompt = `**TASK:** Analyze transcript and output the STRICT JSON schema discussed. **EPISODE:** ${episodeTitle}\n**PODCAST:** ${podcastTitle}\n**TRANSCRIPT:**\n${transcript.length>15000?transcript.slice(0,15000)+'\n\n[Transcript truncated]':transcript}\nRespond ONLY with valid JSON.`;
 
-  async function call(modelPrompt, attempt=1){
+  const enhancedTROOPPrompt = buildTroopPrompt(transcript, episodeTitle, podcastTitle);
+
+  async function callOpenAI(prompt) {
     const { default: fetch } = await import('node-fetch');
     const resp = await fetch(APP_CONFIG.OPENAI.CHAT_URL, {
-      method:'POST',
-      headers:{ Authorization:`Bearer ${openaiApiKey}`,'Content-Type':'application/json'},
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${openaiApiKey}`,
+        'Content-Type': 'application/json',
+      },
       body: JSON.stringify({
         model: APP_CONFIG.OPENAI.ANALYSIS_MODEL,
-        response_format:{type:'json_object'},
-        temperature: attempt===1?0.6:0.4,
+        response_format: { type: 'json_object' },
+        temperature: 0.7,
         max_tokens: 4000,
-        messages:[{role:'system',content:baseSystem},{role:'user',content:modelPrompt}],
+        messages: [
+          { role: 'system', content: baseSystem },
+          { role: 'user', content: prompt },
+        ],
       }),
+      signal: AbortSignal.timeout(90_000),
     });
-    const status = resp.status; const raw = await resp.text();
-    if(status<200||status>=300) return {ok:false,status,errorText:raw};
-    try{
-      const env = JSON.parse(raw);
-      const content = env?.choices?.[0]?.message?.content;
-      if(!content) throw new Error('No content');
-      return {ok:true,json:extractJsonObject(content)};
-    }catch{
-      try{ return {ok:true,json:extractJsonObject(raw)}; }catch(e){ return {ok:false,status,errorText:`JSON parse fail: ${e.message}`}; }
+
+    const status = resp.status;
+    const text = await resp.text();
+
+    if (status < 200 || status >= 300) {
+      return { ok: false, status, errorText: `HTTP ${status} ${text.slice(0, 400)}` };
+    }
+
+    let data;
+    try { data = JSON.parse(text); }
+    catch (e) { return { ok: false, status, errorText: `JSON parse error: ${e.message} | raw=${text.slice(0, 400)}...` }; }
+
+    const content = data.choices?.[0]?.message?.content;
+    if (!content) return { ok: false, status, errorText: `No content in response | raw=${text.slice(0, 400)}...` };
+
+    try { return { ok: true, json: JSON.parse(content) }; }
+    catch {
+      const match = content.match(/\{[\s\S]*\}/);
+      if (match) { try { return { ok: true, json: JSON.parse(match[0]) }; } catch {} }
+      return { ok: false, status, errorText: `Model content not valid JSON` };
     }
   }
 
-  let a = await call(prompt,1); if(a.ok) return a.json;
-  a = await call(prompt,2); if(a.ok) return a.json;
+  // Try 1
+  let attempt = await callOpenAI(enhancedTROOPPrompt);
+  if (attempt.ok) return attempt.json;
 
-  // distilled fallback
-  const distilled = transcript.slice(0,8000);
-  a = await call(`Distill the following first, then produce the same JSON:\n${distilled}`,2);
-  if(a.ok) return a.json;
+  // Try 2 (transient)
+  attempt = await callOpenAI(enhancedTROOPPrompt);
+  if (attempt.ok) return attempt.json;
 
-  return {...createFallbackAnalysis(transcript,episodeTitle), _debug_troop_fail:{error:a.errorText||'Unknown'}};
-}
-function createFallbackAnalysis(transcript, episodeTitle){
+  // Distill → Analyze
+  const distilled = await distillTranscript(transcript, openaiApiKey, baseSystem);
+  const distilledPrompt = enhancedTROOPPrompt.replace(
+    /\*\*TRANSCRIPT:\*\*[\s\S]*$/m,
+    `**TRANSCRIPT (DISTILLED):**\n${distilled}\n\nRespond ONLY with valid JSON.`
+  );
+  attempt = await callOpenAI(distilledPrompt);
+  if (attempt.ok) return attempt.json;
+
   return {
-    episode_summary:"Episode successfully transcribed. Enhanced AI analysis temporarily unavailable - using fallback.",
-    tweetable_quotes:[
-      `🎙️ New episode: "${episodeTitle}" - packed with insights for growth!`,
-      "📈 Every episode is an opportunity to connect with your audience.",
-      "🚀 Consistent content creation is the key to podcast growth.",
+    ...createFallbackAnalysis(transcript, episodeTitle),
+    _debug_troop_fail: attempt.errorText || 'unknown'
+  };
+}
+
+function buildTroopPrompt(transcript, episodeTitle, podcastTitle) {
+  return `**TASK:**
+Analyze the provided transcript and generate a comprehensive 10-section growth strategy.
+
+**ROLE:** Podcast Growth Agent (marketing/SEO/community).
+
+**CRITICAL REQUIREMENTS:**
+- EXACTLY 3 tweetable quotes
+- EXACTLY 3 community suggestions
+- EXACTLY 3 cross-promo matches
+- Niche communities (1K–100K), not generic
+- Use actual transcript content
+
+**OUTPUT:** (valid JSON, arrays sized exactly as specified)
+{
+  "episode_summary": "...",
+  "tweetable_quotes": ["...", "...", "..."],
+  "topics_keywords": ["...", "...", "...", "...", "..."],
+  "optimized_title": "...",
+  "optimized_description": "...",
+  "community_suggestions": [
+    {"name":"...","platform":"...","url":"...","why":"...","post_angle":"...","member_size":"...","engagement_strategy":"..."},
+    {"name":"...","platform":"...","url":"...","why":"...","post_angle":"...","member_size":"...","engagement_strategy":"..."},
+    {"name":"...","platform":"...","url":"...","why":"...","post_angle":"...","member_size":"...","engagement_strategy":"..."}
+  ],
+  "cross_promo_matches": [
+    {"podcast_name":"...","host_name":"...","contact_info":"...","collaboration_angle":"...","suggested_approach":"..."},
+    {"podcast_name":"...","host_name":"...","contact_info":"...","collaboration_angle":"...","suggested_approach":"..."},
+    {"podcast_name":"...","host_name":"...","contact_info":"...","collaboration_angle":"...","suggested_approach":"..."}
+  ],
+  "trend_piggyback":"...",
+  "social_caption":"...",
+  "next_step":"...",
+  "growth_score":"..."
+}
+
+**EPISODE:**
+Title: ${episodeTitle || 'New Episode'}
+Podcast: ${podcastTitle || 'Podcast'}
+
+**TRANSCRIPT:**
+${transcript.length > 15000 ? transcript.slice(0, 15000) + '\n[Truncated]' : transcript}
+
+Respond ONLY with valid JSON.`;
+}
+
+async function distillTranscript(transcript, openaiApiKey, baseSystem) {
+  const { default: fetch } = await import('node-fetch');
+  const prompt = [
+    'Condense transcript into JSON { "summary":"", "key_points":[""], "topics":[""], "quotes":[""] }',
+    'Focus only on marketing-relevant themes and quotable lines.',
+    transcript.length > 24000 ? transcript.slice(0, 24000) + '\n[Truncated]' : transcript,
+  ].join('\n');
+
+  const r = await fetch(APP_CONFIG.OPENAI.CHAT_URL, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${openaiApiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: APP_CONFIG.OPENAI.ANALYSIS_MODEL,
+      response_format: { type: 'json_object' },
+      temperature: 0.5,
+      max_tokens: 1200,
+      messages: [{ role: 'system', content: baseSystem }, { role: 'user', content: prompt }],
+    }),
+    signal: AbortSignal.timeout(60_000),
+  });
+
+  const raw = await r.text();
+  try {
+    const data = JSON.parse(raw);
+    const content = data.choices?.[0]?.message?.content || '{}';
+    const json = JSON.parse(content);
+    return [
+      `SUMMARY: ${json.summary || ''}`,
+      `KEY_POINTS: ${(json.key_points || []).join(' | ')}`,
+      `TOPICS: ${(json.topics || []).join(', ')}`,
+      `QUOTES: ${(json.quotes || []).join(' | ')}`,
+    ].join('\n');
+  } catch {
+    return transcript.slice(0, 8000);
+  }
+}
+
+function createFallbackAnalysis(transcript, episodeTitle) {
+  return {
+    episode_summary: "Episode transcribed. Advanced analysis temporarily unavailable (fallback).",
+    tweetable_quotes: [
+      `🎙️ New episode: "${episodeTitle}" — big insights inside!`,
+      "📈 Every episode is a chance to earn a new listener.",
+      "🚀 Consistency compounds your podcast growth."
     ],
-    topics_keywords:["podcast","content","growth","strategy","audience"],
-    optimized_title: episodeTitle || "Optimize This Episode Title for SEO",
-    optimized_description:"Use the episode content to craft an engaging description that drives discovery and engagement.",
-    community_suggestions:[
-      {name:"Mindfulness Community",platform:"Reddit",url:"https://reddit.com/r/mindfulness",why:"Share mindful practices and wellness insights"},
-      {name:"Self Care Support",platform:"Facebook",url:"https://facebook.com/groups/selfcaresupport",why:"Connect with people focused on personal wellness"},
-      {name:"Wellness Warriors",platform:"Discord",url:"https://discord.com/invite/wellness",why:"Real-time wellness discussions"},
+    topics_keywords: ["podcast", "growth", "strategy", "audience", "content"],
+    optimized_title: episodeTitle || "Optimize this title for SEO",
+    optimized_description: "Craft a clear value-forward description with primary and related keywords.",
+    community_suggestions: [
+      { name: "Mindfulness", platform: "Reddit", url: "https://reddit.com/r/mindfulness", why: "Active, aligned topics" },
+      { name: "Self Care Support", platform: "Facebook", url: "https://facebook.com/groups/selfcaresupport", why: "Engaged wellness audience" },
+      { name: "Wellness Warriors", platform: "Discord", url: "https://discord.com/invite/wellness", why: "Realtime discussions" }
     ],
-    cross_promo_matches:[
-      {podcast_name:"The Wellness Hour",host_name:"Sarah Johnson",contact_info:"@sarahwellness",collaboration_angle:"Practical wellness overlap"},
-      {podcast_name:"Mindful Living Daily",host_name:"Mike Chen",contact_info:"mike@mindfulpodcast.com",collaboration_angle:"Mindfulness-focused audience"},
-      {podcast_name:"Health & Home",host_name:"Lisa Rodriguez",contact_info:"@healthandhomepod",collaboration_angle:"Healthy living spaces"},
+    cross_promo_matches: [
+      { podcast_name: "The Wellness Hour", host_name: "Sarah Johnson", contact_info: "@sarahwellness", collaboration_angle: "Practical overlap" },
+      { podcast_name: "Mindful Living Daily", host_name: "Mike Chen", contact_info: "mike@mindfulpodcast.com", collaboration_angle: "Mindfulness focus" },
+      { podcast_name: "Health & Home", host_name: "Lisa Rodriguez", contact_info: "@healthandhomepod", collaboration_angle: "Healthy spaces" }
     ],
-    trend_piggyback:"Connect to current wellness and mental health awareness trends (#MindfulMonday #SelfCareSunday).",
-    social_caption:`🎙️ New episode live: "${episodeTitle}" — dive into insights that matter. #podcast #wellness #mindfulness`,
-    next_step:"Create 3 post variants with quotes + hashtags; share in one targeted community today.",
-    growth_score:"75/100 - Transcribed successfully; advanced analysis fell back.",
+    trend_piggyback: "Tie to current wellness awareness hashtags (#MindfulMonday #SelfCareSunday).",
+    social_caption: `🎙️ New episode: "${episodeTitle}" — listen now. #podcast #growth`,
+    next_step: "Create 3 quote posts with hashtags and share in one niche community today.",
+    growth_score: "75/100 – transcription OK; advanced analysis fell back.",
   };
 }
