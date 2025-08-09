@@ -1,18 +1,12 @@
 // api/analyze-apple-podcast.js
-// Apple URL → get real MP3 (race: metadata service OR iTunes+RSS) → /tmp → Vercel Blob → Groq → TROOP
+// Apple Podcasts URL → metadata → fetch MP3 to Buffer (no /tmp) → upload to Vercel Blob → Groq Whisper → Enhanced TROOP (JSON-forced + retries)
 
 import { setCorsHeaders } from '../lib/cors.js';
 import FormData from 'form-data';
-import fs from 'fs';
-import path from 'path';
-import { pipeline } from 'stream/promises';
+import { put } from '@vercel/blob';
 
 const APP_CONFIG = {
-  // We TRY metadata service for quick titles/descriptions, but we never block on it.
-  METADATA_URL: 'https://podcast-api-amber.vercel.app/api/transcribe',
-  ITUNES_LOOKUP_URL: 'https://itunes.apple.com/lookup',
-  ITUNES_COUNTRY: process.env.ITUNES_COUNTRY || 'US',
-
+  METADATA_URL: 'https://podcast-api-amber.vercel.app/api/transcribe', // metadataOnly=true
   GROQ: {
     API_URL: 'https://api.groq.com/openai/v1/audio/transcriptions',
     MODEL: 'whisper-large-v3-turbo',
@@ -22,17 +16,8 @@ const APP_CONFIG = {
     CHAT_URL: 'https://api.openai.com/v1/chat/completions',
     ANALYSIS_MODEL: 'gpt-4o-mini',
   },
-
-  // We’ll upload to Vercel Blob with an access token (create in Vercel → Storage → Tokens)
-  BLOB_TOKEN: process.env.BLOB_READ_WRITE_TOKEN, // required
-  BLOB_BUCKET_PREFIX: 'apple-url/',
-
-  HARD_SIZE_LIMIT_BYTES: 1024 * 1024 * 300, // 300 MB
-  META_TIMEOUT_MS: 7000,
-  FETCH_TIMEOUT_MS: 60000,
-  OPENAI_TIMEOUT_MS: 90000,
-  GROQ_TIMEOUT_MS: 180000,
-  MAX_RETRIES: 2,
+  HARD_SIZE_LIMIT_BYTES: 1024 * 1024 * 300, // 300MB cap to avoid OOM
+  FETCH_TIMEOUT_MS: 60_000,
 };
 
 export default async function handler(req, res) {
@@ -40,236 +25,234 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const started = Date.now();
+  const startTime = Date.now();
   const debug = [];
 
   try {
     const { appleUrl, title } = await readJsonBody(req);
     if (!appleUrl) return res.status(400).json({ error: 'Apple Podcast URL is required' });
+
+    if (!process.env.BLOB_READ_WRITE_TOKEN) {
+      return res.status(500).json({ error: 'Missing BLOB_READ_WRITE_TOKEN env var' });
+    }
+    if (!process.env.GROQ_API_KEY) {
+      return res.status(500).json({ error: 'Missing GROQ_API_KEY env var' });
+    }
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ error: 'Missing OPENAI_API_KEY env var' });
+    }
+
     debug.push(`🚀 Start Apple URL flow: ${appleUrl}`);
+    debug.push('🔎 Fetching metadata (metadataOnly=true)…');
 
-    // 1) Get real MP3 URL (race: metadata service vs iTunes+RSS)
-    const { episodeTitle, podcastTitle, audioUrl, description, keywords, metaPath } =
-      await getAudioUrlFast(appleUrl, title, debug);
-    if (!audioUrl) throw new Error('Failed to resolve audio URL');
-    debug.push(`🥇 Metadata winner: ${metaPath}`);
-    debug.push(`🎵 MP3: ${String(audioUrl).slice(0, 140)}…`);
-
-    // 2) Guard: absurdly large files
-    const { contentLength } = await headInfo(audioUrl);
-    if (contentLength && contentLength > APP_CONFIG.HARD_SIZE_LIMIT_BYTES) {
-      return res.status(413).json({
-        error: `Audio too large (${Math.round(contentLength / 1024 / 1024)}MB). Use the MP3 upload path.`,
-        debug,
-      });
-    }
-
-    // 3) Download MP3 → /tmp
-    const tmpInfo = await downloadToTmpWithRetries(audioUrl, APP_CONFIG.MAX_RETRIES, APP_CONFIG.FETCH_TIMEOUT_MS);
-    debug.push(`📁 Downloaded to /tmp: ~${Math.round(tmpInfo.sizeBytes / 1024 / 1024)}MB`);
-
-    // 4) **Upload /tmp → Vercel Blob** (same as your working MP3 flow)
-    const blobInfo = await uploadTmpToVercelBlob(tmpInfo.tmpPath, `${APP_CONFIG.BLOB_BUCKET_PREFIX}${Date.now()}.mp3`);
-    debug.push(`🟧 Uploaded to Vercel Blob: ${blobInfo.url}`);
-
-    // 5) Transcribe **from Blob URL** (same pattern as analyze-from-blob.js)
-    const transcription = await transcribeFromBlobWithGroq(blobInfo.url, episodeTitle);
-    debug.push(`✅ Transcribed (${transcription.transcript.length} chars)`);
-
-    // 6) TROOP analysis (JSON-forced)
-    const analysis = await analyzeWithTROOP(transcription.transcript, episodeTitle, podcastTitle);
-    debug.push('✅ TROOP analysis ok');
-
-    const processingTime = Date.now() - started;
-    return res.status(200).json({
-      success: true,
-      source: 'Apple URL + Vercel Blob + Groq Whisper + TROOP',
-      metadata: {
-        title: episodeTitle,
-        podcastTitle,
-        description,
-        keywords: keywords || [],
-        originalUrl: appleUrl,
-        audioUrl,
-        blobUrl: blobInfo.url,
-        transcriptionSource: transcription.metrics.source,
-        duration: transcription.metrics.durationSeconds,
-        processing_time_ms: processingTime,
-        processed_at: new Date().toISOString(),
-        api_version: '4.6-apple-url-blob',
-      },
-      transcript: transcription.transcript,
-      analysis,
-      debug,
-    });
-  } catch (err) {
-    const processingTime = Date.now() - started;
-    return res.status(500).json({
-      error: 'Analysis failed',
-      details: err.message,
-      processing_time_ms: processingTime,
-      debug,
-    });
-  }
-}
-
-/* ---------------- Apple → MP3 resolution (race) ---------------- */
-
-async function getAudioUrlFast(appleUrl, title, debug) {
-  const metaPromise = getFromMetadataService(appleUrl, title, debug);
-  const rssPromise  = getFromItunesRss(appleUrl, title, debug);
-
-  const winner = await Promise.race([
-    metaPromise,
-    rssPromise,
-    (async () => { await wait(APP_CONFIG.META_TIMEOUT_MS); return rssPromise; })(),
-  ]);
-
-  if (winner?.audioUrl) return winner;
-
-  const settled = await Promise.allSettled([metaPromise, rssPromise]);
-  const ok = settled.find(s => s.status === 'fulfilled' && s.value?.audioUrl);
-  if (ok) return ok.value;
-
-  throw new Error('Could not resolve audio URL from metadata service or RSS');
-}
-
-async function getFromMetadataService(appleUrl, title, debug) {
-  try {
-    const r = await fetchWithTimeout(
-      APP_CONFIG.METADATA_URL,
-      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: appleUrl, metadataOnly: true }) },
-      APP_CONFIG.META_TIMEOUT_MS
-    );
-    const text = await r.text();
-    const lines = text.trim().split('\n').filter(Boolean);
-    let meta = {};
-    for (const line of lines.reverse()) {
-      try {
-        const parsed = JSON.parse(line);
-        if (parsed.status === 'success' || parsed.title) { meta = parsed; break; }
-      } catch {}
-    }
+    // 1) Metadata only (fast)
+    const meta = await getEpisodeMetadata(appleUrl, debug);
     const episodeTitle = meta.title || title || 'Episode';
     const podcastTitle = meta.podcast_title || meta.podcastTitle || 'Podcast';
     const audioUrl = pickAudioUrl(meta);
     if (!audioUrl) {
-      debug.push('⚠️ Metadata service lacked audio URL');
-      return { episodeTitle, podcastTitle, audioUrl: null, description: meta.description, keywords: meta.keywords, metaPath: 'metadata-service(no-audio)' };
+      return res.status(400).json({ error: 'No audio URL found in episode metadata.', debug });
     }
-    return { episodeTitle, podcastTitle, audioUrl, description: meta.description, keywords: meta.keywords, metaPath: 'metadata-service' };
-  } catch (e) {
-    debug.push(`⚠️ Metadata service failed: ${e.message}`);
-    return { episodeTitle: title || 'Episode', podcastTitle: 'Podcast', audioUrl: null, metaPath: 'metadata-service-failed' };
+
+    debug.push(`🎉 Metadata: "${episodeTitle}" | Podcast: "${podcastTitle}"`);
+    debug.push(`🎵 Enclosure URL: ${String(audioUrl).slice(0, 160)}…`);
+
+    // 2) Download MP3 fully into memory (cap to 300MB)
+    debug.push('📥 Downloading MP3 into memory (no /tmp)…');
+    const { buffer: fileBuffer, sizeBytes } = await downloadToBufferWithCap(audioUrl, APP_CONFIG.HARD_SIZE_LIMIT_BYTES, APP_CONFIG.FETCH_TIMEOUT_MS);
+    debug.push(`📦 MP3 size: ~${Math.round(sizeBytes / 1024 / 1024)}MB`);
+
+    // 3) Upload to Vercel Blob (public)
+    const blobName = `apple/${slugify(podcastTitle)}-${slugify(episodeTitle)}-${Date.now()}.mp3`;
+    debug.push(`☁️ Uploading to Vercel Blob: ${blobName}`);
+
+    const putResult = await put(blobName, fileBuffer, {
+      access: 'public',
+      contentType: 'audio/mpeg',
+      token: process.env.BLOB_READ_WRITE_TOKEN,
+      addRandomSuffix: false,
+    });
+
+    const blobUrl = putResult?.url;
+    if (!blobUrl) {
+      throw new Error('Blob upload returned no URL');
+    }
+    debug.push(`✅ Blob stored: ${blobUrl}`);
+
+    // 4) Transcribe with Groq (use same buffer)
+    debug.push('⚡ Transcribing via Groq Whisper…');
+    const transcription = await transcribeWithGroqBuffer(fileBuffer, episodeTitle);
+    debug.push(`📝 Transcript chars: ${transcription.transcript.length}`);
+
+    // 5) Enhanced TROOP analysis (JSON-forced + retries + distill)
+    debug.push('🧠 Running Enhanced TROOP analysis…');
+    const analysis = await analyzeWithEnhancedTROOP(
+      transcription.transcript,
+      episodeTitle,
+      podcastTitle
+    );
+    debug.push('🏁 Enhanced TROOP analysis completed');
+
+    const processingTime = Date.now() - startTime;
+
+    return res.status(200).json({
+      success: true,
+      source: 'Apple URL + Vercel Blob + Groq Whisper + Enhanced TROOP',
+      metadata: {
+        title: episodeTitle,
+        duration: meta.duration || transcription.metrics.durationSeconds,
+        podcastTitle,
+        originalUrl: appleUrl,
+        searchTerm: meta.search_term,
+        listenNotesId: meta.listennotes_id,
+        audioUrl,             // original enclosure
+        blobUrl,              // our stored copy
+        transcriptionSource: transcription.metrics.source,
+        audio_metrics: transcription.metrics,
+        processing_time_ms: processingTime,
+        processed_at: new Date().toISOString(),
+        api_version: '4.3-apple-blob-troop-json',
+      },
+      transcript: transcription.transcript,
+      description: meta.description,
+      keywords: meta.keywords || [],
+      analysis,
+      debug,
+    });
+  } catch (err) {
+    const processingTime = Date.now() - startTime;
+    return res.status(500).json({
+      error: 'Analysis failed',
+      details: String(err?.message || err),
+      processing_time_ms: processingTime,
+    });
   }
 }
 
-async function getFromItunesRss(appleUrl, title, debug) {
-  const { showId, episodeId } = extractIdsFromAppleUrl(appleUrl);
-  if (!showId) throw new Error('Could not parse show id from Apple URL');
+/* ---------------------------
+   Helpers
+----------------------------*/
 
-  const feedUrl = await lookupFeedUrl(showId, debug);
-  if (!feedUrl) throw new Error('Could not resolve RSS feed URL via iTunes lookup');
+async function readJsonBody(req) {
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+  return JSON.parse(raw);
+}
 
-  const rss = await fetchWithTimeout(feedUrl, { method: 'GET' }, 15000);
-  const rssXml = await rss.text();
+async function getEpisodeMetadata(appleUrl, debug) {
+  const { default: fetch } = await import('node-fetch');
+  const r = await fetch(APP_CONFIG.METADATA_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: appleUrl, metadataOnly: true }),
+  });
 
-  const match = findEpisodeInRss(rssXml, { episodeId, expectedTitle: title });
-  if (!match || !match.enclosureUrl) throw new Error('Could not locate episode enclosure in RSS');
+  if (!r.ok) {
+    debug.push('⚠️ Metadata service unavailable, falling back to URL parse');
+    return extractBasicMetadataFromUrl(appleUrl);
+  }
 
+  const text = await r.text();
+  const lines = text.trim().split('\n').filter(Boolean);
+  // pick the last good JSON line
+  for (const line of lines.reverse()) {
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed.status === 'success' || parsed.title) return parsed;
+    } catch { /* ignore */ }
+  }
+  return extractBasicMetadataFromUrl(appleUrl);
+}
+
+function pickAudioUrl(meta) {
+  return meta.audio_url || meta.audioUrl || meta.enclosure_url || meta.mp3_url || null;
+}
+
+function extractBasicMetadataFromUrl(appleUrl) {
+  const parts = appleUrl.split('/');
+  const titlePart = parts.find((p) => p.includes('-') && !p.includes('id'));
+  const title = titlePart
+    ? titlePart.replace(/-/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase())
+    : 'Episode';
   return {
-    episodeTitle: match.title || title || 'Episode',
-    podcastTitle: match.podcastTitle || 'Podcast',
-    audioUrl: match.enclosureUrl,
-    description: null,
-    keywords: [],
-    metaPath: 'itunes+rss',
+    title,
+    podcast_title: 'Podcast',
+    description: 'Episode analysis from Apple Podcast URL',
+    duration: 0,
   };
 }
 
-/* ---------------- Download → /tmp → Blob ---------------- */
-
-async function downloadToTmpWithRetries(audioUrl, maxRetries, timeoutMs) {
-  let lastErr;
-  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
-    try { return await downloadAudioToTmp(audioUrl, timeoutMs); }
-    catch (e) { lastErr = e; if (attempt <= maxRetries) await wait(600 * attempt); }
-  }
-  throw lastErr;
+function slugify(s = '') {
+  return String(s)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60);
 }
 
-async function downloadAudioToTmp(audioUrl, timeoutMs) {
-  const res = await fetchWithTimeout(audioUrl, { method: 'GET' }, timeoutMs);
-  if (!res.ok || !res.body) throw new Error(`Download failed ${res.status} ${res.statusText}`);
-  const tmpPath = path.join('/tmp', `episode-${Date.now()}.mp3`);
-  await pipeline(res.body, fs.createWriteStream(tmpPath));
-  const stat = fs.statSync(tmpPath);
-  if (!stat.size || stat.size < 1024) { try { fs.unlinkSync(tmpPath); } catch {}; throw new Error('Downloaded audio empty/truncated'); }
-  return { tmpPath, sizeBytes: stat.size };
-}
-
-async function uploadTmpToVercelBlob(tmpPath, blobKey) {
-  if (!APP_CONFIG.BLOB_TOKEN) throw new Error('BLOB_READ_WRITE_TOKEN not set');
-
-  // Use Blob REST API (no SDK dependency). We’ll PUT the bytes to the signed URL.
+async function downloadToBufferWithCap(url, maxBytes, timeoutMs) {
   const { default: fetch } = await import('node-fetch');
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs).unref?.();
 
-  // 1) Create upload URL
-  const createRes = await fetch('https://api.vercel.com/v2/blobs', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${APP_CONFIG.BLOB_TOKEN}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      pathname: blobKey,
-      addRandomSuffix: false,
-      mimeType: 'audio/mpeg',
-      access: 'public',
-    }),
+  const resp = await fetch(url, { signal: controller.signal });
+  clearTimeout(t);
+
+  if (!resp.ok || !resp.body) {
+    throw new Error(`Failed to fetch audio: ${resp.status} ${resp.statusText}`);
+  }
+
+  const chunks = [];
+  let total = 0;
+
+  await new Promise((resolve, reject) => {
+    resp.body.on('data', (chunk) => {
+      total += chunk.length;
+      if (total > maxBytes) {
+        resp.body.destroy();
+        reject(new Error(`Audio too large (${Math.round(total / 1024 / 1024)}MB). Use MP3 upload path.`));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    resp.body.on('end', resolve);
+    resp.body.on('error', reject);
   });
-  if (!createRes.ok) throw new Error(`Blob create failed: ${createRes.status} ${await createRes.text()}`);
-  const createJson = await createRes.json();
-  const { uploadUrl, url } = createJson;
 
-  // 2) Upload file bytes via PUT (stream)
-  const putRes = await fetch(uploadUrl, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'audio/mpeg' },
-    body: fs.createReadStream(tmpPath),
-  });
-  if (!putRes.ok) throw new Error(`Blob upload failed: ${putRes.status} ${await putRes.text()}`);
-
-  try { fs.unlinkSync(tmpPath); } catch {}
-  return { url };
+  return { buffer: Buffer.concat(chunks), sizeBytes: total };
 }
 
-/* ---------------- Transcribe (from Blob URL) ---------------- */
+/* ---------------------------
+   Transcription (Groq)
+----------------------------*/
 
-async function transcribeFromBlobWithGroq(blobUrl, filenameBase = 'Episode') {
+async function transcribeWithGroqBuffer(fileBuffer, filename = 'Episode') {
   const groqApiKey = process.env.GROQ_API_KEY;
-  if (!groqApiKey) throw new Error('GROQ_API_KEY not set');
+  if (!groqApiKey) throw new Error('Groq API key not configured');
 
-  // Download blob bytes to buffer (same approach as your analyze-from-blob.js)
-  const fileResponse = await fetchWithTimeout(blobUrl, { method: 'GET' }, APP_CONFIG.GROQ_TIMEOUT_MS);
-  if (!fileResponse.ok) throw new Error(`Blob fetch failed: ${fileResponse.status} ${fileResponse.statusText}`);
-  const fileArrayBuffer = await fileResponse.arrayBuffer();
-  const fileBuffer = Buffer.from(fileArrayBuffer);
-
+  const { default: fetch } = await import('node-fetch');
   const formData = new FormData();
-  formData.append('file', fileBuffer, { filename: `${filenameBase}.mp3`, contentType: 'audio/mpeg' });
+  formData.append('file', fileBuffer, {
+    filename: `${filename}.mp3`,
+    contentType: 'audio/mpeg',
+  });
   formData.append('model', APP_CONFIG.GROQ.MODEL);
   formData.append('response_format', APP_CONFIG.GROQ.RESPONSE_FORMAT);
 
-  const r = await fetchWithTimeout(
-    APP_CONFIG.GROQ.API_URL,
-    { method: 'POST', headers: { Authorization: `Bearer ${groqApiKey}`, ...formData.getHeaders() }, body: formData },
-    APP_CONFIG.GROQ_TIMEOUT_MS
-  );
-  if (!r.ok) { const t = await r.text().catch(()=>''); throw new Error(`Groq ${r.status} ${t}`); }
-  const transcript = await r.text();
-  const durationEstimate = transcript.length / 8;
+  const response = await fetch(APP_CONFIG.GROQ.API_URL, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${groqApiKey}`, ...formData.getHeaders() },
+    body: formData,
+  });
 
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => '');
+    throw new Error(`Groq API error: ${response.status} ${errorText}`);
+  }
+
+  const transcript = await response.text();
+  const durationEstimate = transcript.length / 8; // your heuristic
   return {
     transcript,
     metrics: {
@@ -281,206 +264,287 @@ async function transcribeFromBlobWithGroq(blobUrl, filenameBase = 'Episode') {
   };
 }
 
-/* ---------------- TROOP analysis (JSON-forced; your prompt) ---------------- */
+/* ---------------------------------
+   Enhanced TROOP (JSON-forced + retries + distill)
+---------------------------------- */
 
-async function analyzeWithTROOP(transcript, episodeTitle = '', podcastTitle = '') {
+async function analyzeWithEnhancedTROOP(transcript, episodeTitle = '', podcastTitle = '') {
   const openaiApiKey = process.env.OPENAI_API_KEY;
   if (!openaiApiKey) return createFallbackAnalysis(transcript, episodeTitle);
 
   const baseSystem = [
     'You are Podcast Growth Agent.',
     'Respond with valid JSON only. No markdown, no code fences, no commentary.',
-    'Do NOT provide medical advice; focus on marketing/SEO/community.',
-    'Arrays MUST contain exactly 3 items for tweetable_quotes, community_suggestions, cross_promo_matches.'
+    'Do NOT provide medical advice or health recommendations; focus strictly on marketing, SEO, audience targeting, and community strategy.',
+    'Arrays MUST contain exactly 3 items for tweetable_quotes, community_suggestions, and cross_promo_matches.'
   ].join(' ');
 
-  const prompt = buildTroopPrompt(transcript, episodeTitle, podcastTitle);
+  const enhancedTROOPPrompt = `**TASK:**
+Analyze the provided podcast episode transcript and generate a comprehensive 10-section growth strategy that helps podcasters expand their audience reach. Extract semantic meaning from the actual transcript content and create actionable marketing recommendations.
 
-  const r = await fetchWithTimeout(
-    APP_CONFIG.OPENAI.CHAT_URL,
+**ROLE:**
+You are Podcast Growth Agent, an expert podcast growth strategist with 10+ years of experience helping independent podcasters grow their shows. You combine deep transcript analysis with advanced SEO strategy and community targeting expertise.
+
+**CRITICAL REQUIREMENTS:**
+- MUST provide EXACTLY 3 tweetable quotes
+- MUST provide EXACTLY 3 community suggestions
+- MUST provide EXACTLY 3 cross-promo matches
+- MUST use NICHE communities (1K-100K members), NOT generic ones like r/podcasts
+- ALL data must be based on actual transcript content
+
+**OUTPUT:**
+Generate analysis in this EXACT JSON format with EXACT array lengths:
+
+{
+  "episode_summary": "2-3 engaging sentences that capture both explicit content and underlying themes, using searchable language while preserving authentic voice",
+  "tweetable_quotes": [
+    "Direct quote from transcript, lightly edited for social media clarity, under 280 characters",
+    "Second actual quote that captures key insight or emotional moment",
+    "Third memorable line from episode content, optimized for shareability"
+  ],
+  "topics_keywords": [
+    "High-intent longtail keywords from transcript (3-5 words)",
+    "Question-based keywords people search",
+    "Problem-solution keywords that match episode content",
+    "Semantic SEO terms that align with episode meaning",
+    "Platform-specific keywords for discovery"
+  ],
+  "optimized_title": "SEO-optimized title with primary keyword front-loaded, emotional hook, and clear benefit (under 60 characters)",
+  "optimized_description": "150-200 word SEO-optimized description that includes primary keyword in first 125 characters, 2-3 related keywords naturally woven in, emotional hooks, clear value proposition, and call-to-action",
+  "community_suggestions": [
     {
+      "name": "SPECIFIC niche community name (1K-100K members, active discussions, topic-relevant)",
+      "platform": "Reddit/Facebook/Discord/LinkedIn",
+      "url": "Direct working URL (or best search query if unknown)",
+      "why": "Specific problem this episode solves for this community + evidence of active discussion",
+      "post_angle": "Conversation starter that provides value before mentioning podcast",
+      "member_size": "Exact member count or best estimate in 1K-100K range",
+      "engagement_strategy": "Platform-specific posting strategy with timing recommendations",
+      "conversion_potential": "Why this community is likely to become listeners"
+    },
+    {
+      "name": "Second niche community (different platform or angle)",
+      "platform": "Platform",
+      "url": "URL or discovery query",
+      "why": "Different angle or pain point addressed",
+      "post_angle": "Alternative value-first post",
+      "member_size": "Count or range",
+      "engagement_strategy": "Approach that fits culture",
+      "conversion_potential": "Expected overlap"
+    },
+    {
+      "name": "Third complementary niche community",
+      "platform": "Platform",
+      "url": "URL or discovery query",
+      "why": "Third angle",
+      "post_angle": "Third approach",
+      "member_size": "Count or range",
+      "engagement_strategy": "Posting strategy",
+      "conversion_potential": "Overlap rationale"
+    }
+  ],
+  "cross_promo_matches": [
+    {
+      "podcast_name": "Complementary podcast (similar size preferred, active host engagement)",
+      "host_name": "Real host name",
+      "contact_info": "Best public handle or email",
+      "audience_overlap": "Estimated %",
+      "collaboration_value": "Mutual benefit explanation",
+      "outreach_timing": "Best time to reach based on their posting cadence",
+      "suggested_approach": "Concrete idea (swap, clip, newsletter, guest)"
+    },
+    {
+      "podcast_name": "Second complementary show",
+      "host_name": "Host",
+      "contact_info": "Handle/email",
+      "audience_overlap": "Estimated %",
+      "collaboration_value": "Mutual benefit",
+      "outreach_timing": "Timing",
+      "suggested_approach": "Idea"
+    },
+    {
+      "podcast_name": "Third complementary show",
+      "host_name": "Host",
+      "contact_info": "Handle/email",
+      "audience_overlap": "Estimated %",
+      "collaboration_value": "Mutual benefit",
+      "outreach_timing": "Timing",
+      "suggested_approach": "Idea"
+    }
+  ],
+  "trend_piggyback": "Current trend or cultural moment this episode connects to, with specific hashtags, timing strategy, and platform recommendations",
+  "social_caption": "Platform-ready caption using actual quotes and authentic voice, optimized for engagement with strategic hashtags and clear call-to-action",
+  "next_step": "One specific, actionable growth tactic they can execute today based on episode content analysis - achievable in 30-60 minutes",
+  "growth_score": "Score out of 100 with detailed explanation based on content quality (30%), audience engagement potential (25%), SEO potential (20%), shareability (15%), actionability (10%)"
+}
+
+**OBJECTIVE:**
+Help independent podcasters who are overwhelmed by marketing and don't know how to grow their audience. They need immediate, actionable steps they can take today to get more listeners without requiring a marketing team or technical knowledge.
+
+**PERSPECTIVE:**
+Approach this analysis from the mindset of a supportive growth partner who understands the creator is likely solo, motivated, but overwhelmed by marketing options. Prioritize long-tail growth strategy over competing in oversaturated broad communities.
+
+**SEMANTIC ANALYSIS METHODOLOGY:**
+1. Use the exact transcript text to establish deep semantic understanding of themes, emotions, and implicit meanings
+2. Identify niche audience segments and specific communities (1K-100K members) that connect to core themes
+3. Prioritize smaller, engaged communities over massive generic ones
+4. Apply advanced SEO principles including keyword optimization and multi-platform discoverability
+5. Extend the episode's reach while preserving authentic voice and core message
+
+**EPISODE INFORMATION:**
+Episode Title: ${episodeTitle || 'New Episode'}
+Podcast: ${podcastTitle || 'Podcast Growth Analysis'}
+
+**TRANSCRIPT:**
+${transcript.length > 15000 ? transcript.substring(0, 15000) + '\n\n[Transcript truncated for processing - full analysis based on episode themes]' : transcript}
+
+**IMPORTANT:**
+- Do NOT use r/podcasts or other generic podcast communities
+- Prefer specific niche communities with real problems this episode solves
+- Provide exactly 3 items in each array
+
+Respond ONLY with valid JSON.`;
+
+  async function callOpenAI(prompt) {
+    const { default: fetch } = await import('node-fetch');
+    const resp = await fetch(APP_CONFIG.OPENAI.CHAT_URL, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${openaiApiKey}`, 'Content-Type': 'application/json' },
+      headers: {
+        Authorization: `Bearer ${openaiApiKey}`,
+        'Content-Type': 'application/json'
+      },
       body: JSON.stringify({
         model: APP_CONFIG.OPENAI.ANALYSIS_MODEL,
-        response_format: { type: 'json_object' },
+        response_format: { type: 'json_object' }, // force JSON
         temperature: 0.7,
         max_tokens: 4000,
         messages: [
           { role: 'system', content: baseSystem },
-          { role: 'user', content: prompt },
+          { role: 'user', content: prompt }
         ],
       }),
-    },
-    APP_CONFIG.OPENAI_TIMEOUT_MS
-  );
+    });
 
-  const status = r.status;
-  const raw = await r.text();
+    const status = resp.status;
+    const text = await resp.text();
 
-  if (status < 200 || status >= 300) return createFallbackAnalysis(transcript, episodeTitle);
-
-  try {
-    const data = JSON.parse(raw);
-    const content = data.choices?.[0]?.message?.content;
-    if (!content) return createFallbackAnalysis(transcript, episodeTitle);
-    try { return JSON.parse(content); }
-    catch {
-      const m = content.match(/\{[\s\S]*\}/);
-      if (m) { try { return JSON.parse(m[0]); } catch {} }
-      return createFallbackAnalysis(transcript, episodeTitle);
+    if (status < 200 || status >= 300) {
+      return { ok: false, status, errorText: text };
     }
-  } catch {
-    return createFallbackAnalysis(transcript, episodeTitle);
+
+    let data;
+    try { data = JSON.parse(text); }
+    catch (e) { return { ok: false, status, errorText: `JSON parse error: ${e.message} | raw=${text.slice(0, 400)}...` }; }
+
+    const content = data.choices?.[0]?.message?.content;
+    if (!content) return { ok: false, status, errorText: `No content in response | raw=${text.slice(0, 400)}...` };
+
+    try {
+      const parsed = JSON.parse(content);
+      return { ok: true, json: parsed };
+    } catch {
+      const match = content.match(/\{[\s\S]*\}/);
+      if (match) { try { return { ok: true, json: JSON.parse(match[0]) }; } catch {} }
+      return { ok: false, status, errorText: `Model content not valid JSON: ${content.slice(0, 300)}...` };
+    }
   }
+
+  // Try 1
+  let attempt = await callOpenAI(enhancedTROOPPrompt);
+  if (attempt.ok) return attempt.json;
+
+  // Try 2 (transient)
+  attempt = await callOpenAI(enhancedTROOPPrompt);
+  if (attempt.ok) return attempt.json;
+
+  // Distill → Analyze
+  const distilled = await distillTranscript(transcript, openaiApiKey, baseSystem);
+  const distilledPrompt = enhancedTROOPPrompt.replace(
+    /\*\*TRANSCRIPT:\*\*[\s\S]*$/m,
+    `**TRANSCRIPT (DISTILLED):**\n${distilled}\n\nRespond ONLY with valid JSON.`
+  );
+  attempt = await callOpenAI(distilledPrompt);
+  if (attempt.ok) return attempt.json;
+
+  return {
+    ...createFallbackAnalysis(transcript, episodeTitle),
+    _debug_troop_fail: {
+      first_error: attempt.errorText,
+      note: 'Fell back after 2 direct attempts + distilled run.',
+    },
+  };
 }
 
-function buildTroopPrompt(transcript, episodeTitle, podcastTitle) {
-  return `**TASK:**
-Analyze the provided podcast episode transcript and generate a comprehensive 10-section growth strategy that helps podcasters expand their audience reach. Extract semantic meaning from the actual transcript content and create actionable marketing recommendations.
+async function distillTranscript(transcript, openaiApiKey, baseSystem) {
+  const distilledPrompt = [
+    'Condense the following transcript into JSON with keys:',
+    '{ "summary": "...", "key_points": ["..."], "entities": ["..."], "topics": ["..."], "quotes": ["..."] }',
+    'Focus ONLY on marketing-relevant themes, audience pain points, quotable lines, and topic clusters.',
+    'Avoid medical advice; do not include instructions or sensitive guidance.',
+    '',
+    transcript.length > 24000 ? transcript.substring(0, 24000) + '\n\n[Truncated for distillation]' : transcript,
+  ].join('\n');
 
-**ROLE:** Podcast Growth Agent (marketing/SEO/community).
+  const { default: fetch } = await import('node-fetch');
+  const resp = await fetch(APP_CONFIG.OPENAI.CHAT_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${openaiApiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: APP_CONFIG.OPENAI.ANALYSIS_MODEL,
+      response_format: { type: 'json_object' },
+      temperature: 0.5,
+      max_tokens: 1200,
+      messages: [
+        { role: 'system', content: baseSystem },
+        { role: 'user', content: distilledPrompt },
+      ],
+    }),
+  });
 
-**CRITICAL REQUIREMENTS:**
-- EXACTLY 3 tweetable quotes
-- EXACTLY 3 community suggestions
-- EXACTLY 3 cross-promo matches
-- Niche communities (1K–100K), not generic
-- Use actual transcript content
-
-**OUTPUT:** (valid JSON, arrays sized exactly as specified)
-{
-  "episode_summary": "...",
-  "tweetable_quotes": ["...", "...", "..."],
-  "topics_keywords": ["...", "...", "...", "...", "..."],
-  "optimized_title": "...",
-  "optimized_description": "...",
-  "community_suggestions": [
-    {"name":"...","platform":"...","url":"...","why":"...","post_angle":"...","member_size":"...","engagement_strategy":"..."},
-    {"name":"...","platform":"...","url":"...","why":"...","post_angle":"...","member_size":"...","engagement_strategy":"..."},
-    {"name":"...","platform":"...","url":"...","why":"...","post_angle":"...","member_size":"...","engagement_strategy":"..."}
-  ],
-  "cross_promo_matches": [
-    {"podcast_name":"...","host_name":"...","contact_info":"...","collaboration_angle":"...","suggested_approach":"..."},
-    {"podcast_name":"...","host_name":"...","contact_info":"...","collaboration_angle":"...","suggested_approach":"..."},
-    {"podcast_name":"...","host_name":"...","contact_info":"...","collaboration_angle":"...","suggested_approach":"..."}
-  ],
-  "trend_piggyback":"...",
-  "social_caption":"...",
-  "next_step":"...",
-  "growth_score":"..."
-}
-
-**EPISODE:**
-Title: ${episodeTitle || 'New Episode'}
-Podcast: ${podcastTitle || 'Podcast Growth Analysis'}
-
-**TRANSCRIPT:**
-${transcript.length > 15000 ? transcript.slice(0, 15000) + '\n[Truncated]' : transcript}
-
-Respond ONLY with valid JSON.`;
+  const text = await resp.text();
+  try {
+    const data = JSON.parse(text);
+    const content = data.choices?.[0]?.message?.content || '{}';
+    const json = JSON.parse(content);
+    return [
+      `SUMMARY: ${json.summary || ''}`,
+      `KEY_POINTS: ${(Array.isArray(json.key_points) ? json.key_points : []).join(' | ')}`,
+      `ENTITIES: ${(Array.isArray(json.entities) ? json.entities : []).join(', ')}`,
+      `TOPICS: ${(Array.isArray(json.topics) ? json.topics : []).join(', ')}`,
+      `QUOTES: ${(Array.isArray(json.quotes) ? json.quotes : []).join(' | ')}`,
+    ].join('\n');
+  } catch {
+    return transcript.slice(0, 8000);
+  }
 }
 
 function createFallbackAnalysis(transcript, episodeTitle) {
   return {
-    episode_summary: "Episode transcribed. Advanced analysis temporarily unavailable (fallback).",
+    episode_summary: "Episode successfully transcribed. Enhanced AI analysis temporarily unavailable - using fallback.",
     tweetable_quotes: [
-      `🎙️ New episode: "${episodeTitle}" — big insights inside!`,
-      "📈 Every episode is a chance to earn a new listener.",
-      "🚀 Consistency compounds your podcast growth."
+      `🎙️ New episode: "${episodeTitle}" - packed with insights for growth!`,
+      "📈 Every episode is an opportunity to connect with your audience.",
+      "🚀 Consistent content creation is the key to podcast growth.",
     ],
-    topics_keywords: ["podcast", "growth", "strategy", "audience", "content"],
-    optimized_title: episodeTitle || "Optimize this title for SEO",
-    optimized_description: "Craft a value-forward description with primary and related keywords.",
+    topics_keywords: ["podcast", "content", "growth", "strategy", "audience"],
+    optimized_title: episodeTitle || "Optimize This Episode Title for SEO",
+    optimized_description: "Use the episode content to craft an engaging description that drives discovery and engagement.",
     community_suggestions: [
-      { name: "Mindfulness", platform: "Reddit", url: "https://reddit.com/r/mindfulness", why: "Active, aligned topics" },
-      { name: "Self Care Support", platform: "Facebook", url: "https://facebook.com/groups/selfcaresupport", why: "Engaged wellness audience" },
-      { name: "Wellness Warriors", platform: "Discord", url: "https://discord.com/invite/wellness", why: "Realtime discussions" }
+      { name: "Mindfulness Community", platform: "Reddit", url: "https://reddit.com/r/mindfulness", why: "Share mindful practices and wellness insights" },
+      { name: "Self Care Support", platform: "Facebook", url: "https://facebook.com/groups/selfcaresupport", why: "Connect with people focused on personal wellness" },
+      { name: "Wellness Warriors", platform: "Discord", url: "https://discord.com/invite/wellness", why: "Real-time community for health and wellness discussions" },
     ],
     cross_promo_matches: [
-      { podcast_name: "The Wellness Hour", host_name: "Sarah Johnson", contact_info: "@sarahwellness", collaboration_angle: "Practical overlap" },
-      { podcast_name: "Mindful Living Daily", host_name: "Mike Chen", contact_info: "mike@mindfulpodcast.com", collaboration_angle: "Mindfulness focus" },
-      { podcast_name: "Health & Home", host_name: "Lisa Rodriguez", contact_info: "@healthandhomepod", collaboration_angle: "Healthy spaces" }
+      { podcast_name: "The Wellness Hour", host_name: "Sarah Johnson", contact_info: "@sarahwellness", collaboration_angle: "Practical wellness overlap" },
+      { podcast_name: "Mindful Living Daily", host_name: "Mike Chen", contact_info: "mike@mindfulpodcast.com", collaboration_angle: "Mindfulness-focused audience" },
+      { podcast_name: "Health & Home", host_name: "Lisa Rodriguez", contact_info: "@healthandhomepod", collaboration_angle: "Healthy living spaces" },
     ],
-    trend_piggyback: "Tie to current wellness awareness hashtags (#MindfulMonday #SelfCareSunday).",
-    social_caption: `🎙️ New episode: "${episodeTitle}" — listen now. #podcast #growth`,
-    next_step: "Create 3 quote posts with hashtags and share in one niche community today.",
-    growth_score: "75/100 – transcription OK; advanced analysis fell back.",
+    trend_piggyback: "Connect to current wellness and mental health awareness trends (#MindfulMonday #SelfCareSunday).",
+    social_caption: `🎙️ New episode live: "${episodeTitle}" — dive into insights that matter. #podcast #wellness #mindfulness`,
+    next_step: "Create 3 post variants with quotes + hashtags; share in one targeted community today.",
+    growth_score: "75/100 - Transcribed successfully; advanced analysis fell back.",
   };
 }
-
-/* ---------------- tiny utils ---------------- */
-
-async function readJsonBody(req) {
-  const chunks = [];
-  for await (const c of req) chunks.push(c);
-  const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-  return JSON.parse(raw);
-}
-function pickAudioUrl(meta) { return meta.audio_url || meta.audioUrl || meta.enclosure_url || meta.mp3_url || null; }
-function extractIdsFromAppleUrl(u) {
-  const showId = (u.match(/\/id(\d+)/) || [])[1] || null;
-  const episodeId = (u.match(/[?&]i=(\d+)/) || [])[1] || null;
-  return { showId, episodeId };
-}
-async function lookupFeedUrl(showId, debug) {
-  const url = `${APP_CONFIG.ITUNES_LOOKUP_URL}?id=${encodeURIComponent(showId)}&country=${encodeURIComponent(APP_CONFIG.ITUNES_COUNTRY)}`;
-  const r = await fetchWithTimeout(url, { method: 'GET' }, 15000);
-  const data = await r.json().catch(() => ({}));
-  const feedUrl = data?.results?.[0]?.feedUrl || null;
-  if (!feedUrl) debug.push('⚠️ iTunes lookup missing feedUrl');
-  return feedUrl;
-}
-function findEpisodeInRss(rssXml, { episodeId, expectedTitle }) {
-  if (episodeId) {
-    const byGuid = new RegExp(`<guid[^>]*>\\s*${episodeId}\\s*<\\/guid>`, 'i');
-    const byItunesGuid = new RegExp(`<itunes:episodeGuid[^>]*>\\s*${episodeId}\\s*<\\/itunes:episodeGuid>`, 'i');
-    const byLink = new RegExp(`<link[^>]*>[^<]*\\?i=${episodeId}[^<]*<\\/link>`, 'i');
-    for (const re of [byGuid, byItunesGuid, byLink]) {
-      const idx = rssXml.search(re);
-      if (idx !== -1) {
-        const block = sliceItemBlock(rssXml, idx);
-        const enclosureUrl = extractEnclosure(block);
-        const title = extractTag(block, 'title');
-        const podcastTitle = extractTag(rssXml, 'title');
-        if (enclosureUrl) return { enclosureUrl, title, podcastTitle };
-      }
-    }
-  }
-  if (expectedTitle) {
-    const titleNorm = expectedTitle.toLowerCase().replace(/\s+/g, ' ').slice(0, 70);
-    const itemRe = /<item[\s\S]*?<\/item>/gi;
-    let m;
-    while ((m = itemRe.exec(rssXml))) {
-      const block = m[0];
-      const t = (extractTag(block, 'title') || '').toLowerCase().replace(/\s+/g, ' ');
-      if (t && (t.includes(titleNorm) || titleNorm.includes(t))) {
-        const enclosureUrl = extractEnclosure(block);
-        if (enclosureUrl) return { enclosureUrl, title: extractTag(block, 'title'), podcastTitle: extractTag(rssXml, 'title') };
-      }
-    }
-  }
-  const firstItem = /<item[\s\S]*?<\/item>/i.exec(rssXml)?.[0] || '';
-  const enclosureUrl = extractEnclosure(firstItem);
-  if (enclosureUrl) return { enclosureUrl, title: extractTag(firstItem, 'title'), podcastTitle: extractTag(rssXml, 'title') };
-  return null;
-}
-function sliceItemBlock(xml, indexNear) {
-  const before = xml.lastIndexOf('<item', indexNear);
-  const after = xml.indexOf('</item>', indexNear);
-  if (before === -1 || after === -1) return '';
-  return xml.slice(before, after + '</item>'.length);
-}
-function extractEnclosure(itemXml) { const m = itemXml.match(/<enclosure[^>]*url="([^"]+)"/i); return m ? m[1] : null; }
-function extractTag(xml, tag) { const m = xml.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i')); return m ? decodeHtml(m[1]).trim() : null; }
-function decodeHtml(s) { return s.replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&#39;/g,"'").replace(/&quot;/g,'"'); }
-async function headInfo(url) {
-  try { const r = await fetchWithTimeout(url, { method: 'HEAD' }, 15000); if (!r.ok) return { contentLength: 0, contentType: '' };
-    return { contentLength: Number(r.headers.get('content-length') || 0), contentType: r.headers.get('content-type') || '' };
-  } catch { return { contentLength: 0, contentType: '' }; }
-}
-async function fetchWithTimeout(url, init = {}, timeoutMs = 30000) {
-  const { default: fetch } = await import('node-fetch');
-  return fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
-}
-function wait(ms){ return new Promise(r=>setTimeout(r, ms)); }
