@@ -1,5 +1,6 @@
 // api/analyze-apple-podcast.js
-// Apple Podcasts URL → metadata → /tmp download (retries/timeouts) → upload to Vercel Blob → Groq Whisper → Enhanced TROOP (JSON-forced + distilled fallback)
+// Apple Podcasts URL → metadata → /tmp download (retries/timeouts) → upload to Vercel Blob →
+// -> CHUNKED Groq Whisper transcription (Range-based) → Enhanced TROOP (JSON-forced + distilled fallback)
 
 import { setCorsHeaders } from '../lib/cors.js';
 import { put } from '@vercel/blob';
@@ -19,9 +20,11 @@ const APP_CONFIG = {
     CHAT_URL: 'https://api.openai.com/v1/chat/completions',
     ANALYSIS_MODEL: 'gpt-4o-mini',
   },
-  HARD_SIZE_LIMIT_BYTES: 1024 * 1024 * 300, // 300MB hard cap
+  HARD_SIZE_LIMIT_BYTES: 1024 * 1024 * 300, // 300MB
   FETCH_TIMEOUT_MS: 60_000,
   MAX_RETRIES: 2,
+  MAX_CHUNK_BYTES: Number(process.env.MAX_CHUNK_MB || 18) * 1024 * 1024, // default 18MB
+  MIN_CHUNK_BYTES: 8 * 1024 * 1024, // 8MB floor
 };
 
 export default async function handler(req, res) {
@@ -33,7 +36,6 @@ export default async function handler(req, res) {
   const debug = [];
 
   try {
-    // ---- Sanity checks
     if (!process.env.BLOB_READ_WRITE_TOKEN) {
       return res.status(500).json({ error: 'Server misconfig: BLOB_READ_WRITE_TOKEN not set' });
     }
@@ -41,24 +43,20 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: 'Server misconfig: GROQ_API_KEY not set' });
     }
 
-    // ---- Parse body
     const { appleUrl, title } = await readJsonBody(req);
     if (!appleUrl) return res.status(400).json({ error: 'Apple Podcast URL is required' });
 
     debug.push(`🚀 Apple analysis start: ${appleUrl}`);
     debug.push('📞 Fetching metadata (fast)…');
 
-    // ---- 1) Episode metadata
     const meta = await getEpisodeMetadata(appleUrl, debug);
     const episodeTitle = meta.title || title || 'Episode';
     const podcastTitle = meta.podcast_title || meta.podcastTitle || 'Podcast';
     const audioUrl = pickAudioUrl(meta);
-    if (!audioUrl) {
-      return res.status(400).json({ error: 'No audio URL found in metadata', debug });
-    }
-    debug.push(`🎵 Audio URL found: ${String(audioUrl).slice(0, 140)}…`);
+    if (!audioUrl) return res.status(400).json({ error: 'No audio URL found in metadata', debug });
 
-    // ---- 2) HEAD check (guard absurd sizes)
+    debug.push(`🎵 Audio URL: ${String(audioUrl).slice(0, 140)}…`);
+
     debug.push('🧪 HEAD check…');
     const { contentLength, contentType } = await headInfo(audioUrl);
     if (contentLength && contentLength > APP_CONFIG.HARD_SIZE_LIMIT_BYTES) {
@@ -68,16 +66,10 @@ export default async function handler(req, res) {
       });
     }
 
-    // ---- 3) Download to /tmp with retries + timeout
     debug.push('📥 Downloading MP3 → /tmp (stream) with retries…');
-    const tmpInfo = await downloadToTmpWithRetries(
-      audioUrl,
-      APP_CONFIG.MAX_RETRIES,
-      APP_CONFIG.FETCH_TIMEOUT_MS
-    );
+    const tmpInfo = await downloadToTmpWithRetries(audioUrl, APP_CONFIG.MAX_RETRIES, APP_CONFIG.FETCH_TIMEOUT_MS);
     debug.push(`📁 Saved to /tmp (${Math.round(tmpInfo.sizeBytes / 1024 / 1024)}MB)`);
 
-    // ---- 4) Upload /tmp to Vercel Blob (public)
     const fileExt = guessExtension(contentType) || '.mp3';
     const blobFilename = safeName(`${episodeTitle}`) + fileExt;
 
@@ -89,25 +81,18 @@ export default async function handler(req, res) {
     });
     debug.push(`✅ Blob uploaded: ${blob.url}`);
 
-    // ---- 5) Download from Blob → Buffer → Groq Whisper (matches your working blob path)
-    debug.push('⚡ Transcribing with Groq Whisper from Blob…');
-    const transcription = await transcribeWithGroqFromBlob(blob.url, blobFilename);
-    debug.push(`✅ Transcribed (${transcription.transcript.length} chars)`);
+    debug.push('⚡ Transcribing with Groq (chunked from Blob)…');
+    const transcription = await transcribeWithGroqFromBlobChunked(blob.url, blobFilename, debug);
+    debug.push(`✅ Transcribed (${transcription.transcript.length} chars) via ${transcription.chunks} chunk(s)`);
 
-    // ---- 6) Enhanced TROOP (superior prompt) with fallback
     debug.push('🧠 Running Enhanced TROOP analysis…');
-    const analysis = await analyzeWithTROOP(
-      transcription.transcript,
-      episodeTitle,
-      podcastTitle
-    );
+    const analysis = await analyzeWithTROOP(transcription.transcript, episodeTitle, podcastTitle);
     debug.push('✅ TROOP analysis complete');
 
     const processingTime = Date.now() - startTime;
-
     return res.status(200).json({
       success: true,
-      source: 'Apple URL → /tmp → Vercel Blob → Groq Whisper → Enhanced TROOP',
+      source: 'Apple URL → /tmp → Blob → Groq (chunked) → Enhanced TROOP',
       metadata: {
         title: episodeTitle,
         podcastTitle,
@@ -119,7 +104,7 @@ export default async function handler(req, res) {
         transcriptionSource: transcription.metrics.source,
         processing_time_ms: processingTime,
         processed_at: new Date().toISOString(),
-        api_version: '5.0-apple-url-blob-troop',
+        api_version: '5.1-apple-url-blob-chunked',
         blob_url: blob.url,
       },
       transcript: transcription.transcript,
@@ -134,7 +119,7 @@ export default async function handler(req, res) {
       processing_time_ms: processingTime,
     });
   } finally {
-    // /tmp cleanup is done inside the download/transcribe functions
+    // tmp cleanup done in helpers
   }
 }
 
@@ -202,7 +187,6 @@ async function headInfo(url) {
       contentType: r.headers.get('content-type') || '',
     };
   } catch {
-    // some hosts block HEAD
     return { contentLength: 0, contentType: '' };
   }
 }
@@ -247,48 +231,101 @@ function safeName(s) {
   return (s || 'episode').replace(/[^a-z0-9\-_]+/gi, '-').slice(0, 80);
 }
 
-async function transcribeWithGroqFromBlob(blobUrl, filename) {
+/* ---------- CHUNKED TRANSCRIPTION FROM BLOB ---------- */
+
+async function transcribeWithGroqFromBlobChunked(blobUrl, filename, debug = []) {
   const { default: fetch } = await import('node-fetch');
   const groqApiKey = process.env.GROQ_API_KEY;
 
-  // Download from blob
-  const fileRes = await fetch(blobUrl);
-  if (!fileRes.ok) throw new Error(`Blob download failed: ${fileRes.status} ${fileRes.statusText}`);
-  const arr = await fileRes.arrayBuffer();
-  const fileBuffer = Buffer.from(arr);
-
-  // Send to Groq
-  const formData = new FormData();
-  formData.append('file', fileBuffer, { filename, contentType: 'audio/mpeg' });
-  formData.append('model', APP_CONFIG.GROQ.MODEL);
-  formData.append('response_format', APP_CONFIG.GROQ.RESPONSE_FORMAT);
-
-  const resp = await fetch(APP_CONFIG.GROQ.API_URL, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${groqApiKey}`, ...formData.getHeaders() },
-    body: formData,
-    // Groq handles large multipart uploads; if any 413 persists we’ll handle at call site
-  });
-
-  if (!resp.ok) {
-    const errorText = await resp.text().catch(() => '');
-    throw new Error(`Groq API error: ${resp.status} ${errorText}`);
+  // 1) Get Blob size
+  const head = await fetch(blobUrl, { method: 'HEAD' });
+  if (!head.ok) throw new Error(`Blob HEAD failed: ${head.status} ${head.statusText}`);
+  const totalBytes = Number(head.headers.get('content-length') || 0);
+  if (!totalBytes) {
+    // fall back to single GET (small file)
+    const fileRes = await fetch(blobUrl);
+    if (!fileRes.ok) throw new Error(`Blob download failed: ${fileRes.status} ${fileRes.statusText}`);
+    const arr = await fileRes.arrayBuffer();
+    return await groqOnce(Buffer.from(arr), filename);
   }
 
-  const transcript = await resp.text();
+  let offset = 0;
+  let chunkSize = Math.min(APP_CONFIG.MAX_CHUNK_BYTES, totalBytes);
+  let part = 1;
+  const parts = [];
+  const startedAt = Date.now();
+
+  while (offset < totalBytes) {
+    const end = Math.min(offset + chunkSize - 1, totalBytes - 1);
+    const rangeHeader = `bytes=${offset}-${end}`;
+    debug.push(`📦 Fetching chunk ${part} (${rangeHeader})`);
+
+    const res = await fetch(blobUrl, { headers: { Range: rangeHeader } });
+    if (!(res.status === 206 || (res.status === 200 && offset === 0 && end === totalBytes - 1))) {
+      throw new Error(`Blob range fetch failed: HTTP ${res.status}`);
+    }
+    const buf = Buffer.from(await res.arrayBuffer());
+
+    try {
+      const tr = await groqOnce(buf, `${filename}.part${part}.mp3`);
+      parts.push(tr.transcript);
+      debug.push(`🧩 Groq OK for chunk ${part} (${buf.length} bytes)`);
+      offset = end + 1;
+      part += 1;
+    } catch (e) {
+      const msg = String(e.message || e);
+      if (/413/.test(msg) && chunkSize > APP_CONFIG.MIN_CHUNK_BYTES) {
+        // halve chunk and retry same offset
+        chunkSize = Math.max(APP_CONFIG.MIN_CHUNK_BYTES, Math.floor(chunkSize / 2));
+        debug.push(`↘️ 413 from Groq, reducing chunk size to ~${Math.round(chunkSize / 1024 / 1024)}MB and retrying`);
+        continue;
+      }
+      throw e;
+    }
+  }
+
+  const transcript = parts.join(' ').replace(/\s+/g, ' ').trim();
   const durationEstimate = transcript.length / 8;
+
+  debug.push(`🧵 Combined ${parts.length} chunk(s) in ${Date.now() - startedAt}ms`);
   return {
     transcript,
+    chunks: parts.length,
     metrics: {
       durationSeconds: Math.round(durationEstimate),
       durationMinutes: Math.round(durationEstimate / 60),
       confidence: 'estimated',
-      source: 'groq',
+      source: 'groq-chunked',
     },
   };
+
+  async function groqOnce(fileBuffer, fname) {
+    const formData = new FormData();
+    formData.append('file', fileBuffer, { filename: fname, contentType: 'audio/mpeg' });
+    formData.append('model', APP_CONFIG.GROQ.MODEL);
+    formData.append('response_format', APP_CONFIG.GROQ.RESPONSE_FORMAT);
+
+    const resp = await fetch(APP_CONFIG.GROQ.API_URL, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${groqApiKey}`, ...formData.getHeaders() },
+      body: formData,
+    });
+
+    if (!resp.ok) {
+      const errorText = await resp.text().catch(() => '');
+      throw new Error(`Groq API error: ${resp.status} ${errorText}`);
+    }
+
+    const text = await resp.text();
+    const dur = text.length / 8;
+    return {
+      transcript: text,
+      metrics: { durationSeconds: Math.round(dur) },
+    };
+  }
 }
 
-/* ---------- Enhanced TROOP (superior prompt, JSON-forced + distilled fallback) ---------- */
+/* ---------- Enhanced TROOP (JSON-forced + distilled fallback) ---------- */
 
 async function analyzeWithTROOP(transcript, episodeTitle = '', podcastTitle = '') {
   const openaiApiKey = process.env.OPENAI_API_KEY;
@@ -350,7 +387,7 @@ async function analyzeWithTROOP(transcript, episodeTitle = '', podcastTitle = ''
   let attempt = await callOpenAI(enhancedTROOPPrompt);
   if (attempt.ok) return attempt.json;
 
-  // Try 2 (transient)
+  // Try 2
   attempt = await callOpenAI(enhancedTROOPPrompt);
   if (attempt.ok) return attempt.json;
 
