@@ -89,10 +89,10 @@ export default async function handler(req, res) {
       debug.push(`⚠️ Temp file cleanup failed: ${cleanupError.message}`);
     }
 
-    // FIXED: Use direct blob transcription instead of chunked
-    debug.push('⚡ Transcribing with Groq (direct from Blob)…');
+    // FIXED: Use URL-based transcription for 100MB support on paid tier
+    debug.push('⚡ Transcribing with Groq (URL method for large files)...');
     const transcription = await transcribeWithGroqFromBlob(blob.url, blobFilename, debug);
-    debug.push(`✅ Transcribed (${transcription.transcript.length} chars) via direct Groq`);
+    debug.push(`✅ Transcribed (${transcription.transcript.length} chars) via URL method`);
 
     debug.push('🧠 Running Enhanced TROOP analysis…');
     let analysis = await analyzeWithTROOP(transcription.transcript, episodeTitle, podcastTitle);
@@ -125,7 +125,7 @@ export default async function handler(req, res) {
     const processingTime = Date.now() - startTime;
     return res.status(200).json({
       success: true,
-      source: 'Apple URL → /tmp → Blob → Groq (direct) → Enhanced TROOP',
+      source: 'Apple URL → /tmp → Blob → Groq (URL) → Enhanced TROOP',
       metadata: {
         title: episodeTitle,
         podcastTitle,
@@ -137,7 +137,7 @@ export default async function handler(req, res) {
         transcriptionSource: transcription.metrics.source,
         processing_time_ms: processingTime,
         processed_at: new Date().toISOString(),
-        api_version: '5.5-apple-url-blob-direct',
+        api_version: '5.6-apple-url-blob-url-method',
         blob_url: blob.url,
       },
       transcript: transcription.transcript,
@@ -270,28 +270,15 @@ async function transcribeWithGroqFromBlob(blobUrl, filename, debug = []) {
   }
 
   try {
-    debug.push('📥 Downloading from blob for direct Groq transcription...');
-    const fileResponse = await fetch(blobUrl, {
-      signal: AbortSignal.timeout(APP_CONFIG.FETCH_TIMEOUT_MS)
-    });
+    debug.push('⚡ Transcribing via Groq URL upload (100MB limit)...');
     
-    if (!fileResponse.ok) {
-      throw new Error(`Failed to download from blob: ${fileResponse.statusText}`);
-    }
-
-    const fileArrayBuffer = await fileResponse.arrayBuffer();
-    const fileBuffer = Buffer.from(fileArrayBuffer);
-    debug.push(`📁 Downloaded ${fileBuffer.length} bytes from blob`);
-
+    // Use the URL parameter instead of file upload for large file support
     const formData = new FormData();
-    formData.append('file', fileBuffer, {
-      filename: filename,
-      contentType: 'audio/mpeg'
-    });
+    formData.append('url', blobUrl);
     formData.append('model', APP_CONFIG.GROQ.MODEL);
     formData.append('response_format', APP_CONFIG.GROQ.RESPONSE_FORMAT);
 
-    debug.push('⚡ Sending to Groq API (direct)...');
+    debug.push(`🔗 Sending blob URL to Groq: ${blobUrl.slice(0, 60)}...`);
     const response = await fetch(APP_CONFIG.GROQ.API_URL, {
       method: 'POST',
       headers: { 
@@ -299,7 +286,7 @@ async function transcribeWithGroqFromBlob(blobUrl, filename, debug = []) {
         ...formData.getHeaders()
       },
       body: formData,
-      signal: AbortSignal.timeout(120_000) // 2 minutes for large files
+      signal: AbortSignal.timeout(180_000) // 3 minutes for large files via URL
     });
 
     if (!response.ok) {
@@ -316,13 +303,13 @@ async function transcribeWithGroqFromBlob(blobUrl, filename, debug = []) {
       durationSeconds: Math.round(durationEstimate),
       durationMinutes: Math.round(durationEstimate / 60),
       confidence: 'estimated',
-      source: 'groq-direct'
+      source: 'groq-url-direct'
     };
     
     return { transcript, metrics };
 
   } catch (error) {
-    debug.push(`❌ Direct Groq transcription failed: ${error.message}`);
+    debug.push(`❌ URL-based Groq transcription failed: ${error.message}`);
     throw new Error(`Transcription failed: ${error.message}`);
   }
 }
