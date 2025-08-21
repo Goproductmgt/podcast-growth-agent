@@ -66,6 +66,9 @@ export default async function handler(req, res) {
    const episodeTitle = meta.title || title || 'Episode';
    const podcastTitle = meta.podcast_title || meta.podcastTitle || 'Podcast';
    const audioUrl = pickAudioUrl(meta);
+   console.log('🔍 METADATA DEBUG:', JSON.stringify(meta, null, 2));
+console.log('🔍 META KEYS:', Object.keys(meta));
+console.log('🎵 EXTRACTED AUDIO URL:', audioUrl);
    if (!audioUrl) return res.status(400).json({ error: 'No audio URL found in metadata', debug });
 
 
