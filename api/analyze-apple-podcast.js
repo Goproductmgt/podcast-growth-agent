@@ -1,9 +1,7 @@
 // api/analyze-apple-podcast.js
-// Apple URL → /tmp download → Vercel Blob → CHUNKED Groq Whisper → Enhanced TROOP
-// Upgrades in this version:
-// - Quote extraction/scoring → better tweetables w/ 1–2 smart hashtags
-// - Keep output as strings (tweetable_quotes) + add quotes_candidates_debug for QA
-// - Stronger Groq 5xx handling: more retries, backoff + chunk-size fallback
+// Apple URL → /tmp download → Vercel Blob → GROQ URL (100MB limit) → Enhanced TROOP
+// FIXED: Now tries Groq URL parameter first (Developer Plan supports 100MB via URL)
+// Fallback to chunking only if URL method fails
 
 import { setCorsHeaders } from '../lib/cors.js';
 import { put } from '@vercel/blob';
@@ -28,8 +26,8 @@ const APP_CONFIG = {
   MAX_RETRIES: 2,
   MAX_CHUNK_BYTES: Number(process.env.MAX_CHUNK_MB || 18) * 1024 * 1024,
   MIN_CHUNK_BYTES: 8 * 1024 * 1024,
-  GROQ_RETRY_COUNT: 4,           // was 2
-  GROQ_RETRY_BASE_DELAY_MS: 700, // backoff base
+  GROQ_RETRY_COUNT: 4,
+  GROQ_RETRY_BASE_DELAY_MS: 700,
 };
 
 export default async function handler(req, res) {
@@ -86,9 +84,9 @@ export default async function handler(req, res) {
     });
     debug.push(`✅ Blob uploaded: ${blob.url}`);
 
-    debug.push('⚡ Transcribing with Groq (chunked from Blob)…');
+    debug.push('⚡ Transcribing with Groq (URL-first, then chunked fallback)…');
     const transcription = await transcribeWithGroqFromBlobChunked(blob.url, blobFilename, debug);
-    debug.push(`✅ Transcribed (${transcription.transcript.length} chars) via ${transcription.chunks} chunk(s)`);
+    debug.push(`✅ Transcribed (${transcription.transcript.length} chars) via ${transcription.chunks} chunk(s) using ${transcription.metrics.source}`);
 
     debug.push('🧠 Running Enhanced TROOP analysis…');
     let analysis = await analyzeWithTROOP(transcription.transcript, episodeTitle, podcastTitle);
@@ -121,7 +119,7 @@ export default async function handler(req, res) {
     const processingTime = Date.now() - startTime;
     return res.status(200).json({
       success: true,
-      source: 'Apple URL → /tmp → Blob → Groq (chunked) → Enhanced TROOP',
+      source: 'Apple URL → /tmp → Blob → Groq (URL-first) → Enhanced TROOP',
       metadata: {
         title: episodeTitle,
         podcastTitle,
@@ -133,7 +131,7 @@ export default async function handler(req, res) {
         transcriptionSource: transcription.metrics.source,
         processing_time_ms: processingTime,
         processed_at: new Date().toISOString(),
-        api_version: '5.4-apple-url-blob-chunked',
+        api_version: '5.5-apple-url-groq-url-fix',
         blob_url: blob.url,
       },
       transcript: transcription.transcript,
@@ -146,6 +144,7 @@ export default async function handler(req, res) {
       error: 'Analysis failed',
       details: String(err.message || err),
       processing_time_ms: processingTime,
+      debug,
     });
   }
 }
@@ -253,23 +252,79 @@ function safeName(s) {
   return (s || 'episode').replace(/[^a-z0-9\-_]+/gi, '-').slice(0, 80);
 }
 
-/* ---------- CHUNKED TRANSCRIPTION FROM BLOB ---------- */
+/* ---------- GROQ TRANSCRIPTION WITH URL-FIRST APPROACH ---------- */
 
 async function transcribeWithGroqFromBlobChunked(blobUrl, filename, debug = []) {
   const { default: fetch } = await import('node-fetch');
   const groqApiKey = process.env.GROQ_API_KEY;
 
-  // 1) Blob size
+  // FIRST: Try URL-based transcription (Developer Plan supports up to 100MB via URL)
+  debug.push('🎯 Trying Groq URL-based transcription first (up to 100MB)...');
+  
+  try {
+    const response = await fetch(APP_CONFIG.GROQ.API_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${groqApiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: APP_CONFIG.GROQ.MODEL,
+        url: blobUrl,  // Use the blob URL directly
+        response_format: APP_CONFIG.GROQ.RESPONSE_FORMAT,
+      }),
+    });
+
+    if (response.ok) {
+      const transcript = await response.text();
+      const durationEstimate = transcript.length / 8;
+      
+      debug.push('✅ Groq URL transcription successful!');
+      return {
+        transcript,
+        chunks: 1,
+        metrics: {
+          durationSeconds: Math.round(durationEstimate),
+          durationMinutes: Math.round(durationEstimate / 60),
+          confidence: 'estimated',
+          source: 'groq-url',
+        },
+      };
+    } else {
+      const errorText = await response.text();
+      debug.push(`⚠️ Groq URL failed: ${response.status} ${errorText}`);
+      
+      // If it's a file size error, fall back to chunking
+      if (response.status === 413 || (errorText.includes('file') && errorText.includes('large'))) {
+        debug.push('🔄 File too large for URL method, falling back to chunking...');
+      } else {
+        // For other errors, still try chunking as fallback
+        debug.push('🔄 URL method failed, trying chunking fallback...');
+      }
+    }
+  } catch (urlError) {
+    debug.push(`⚠️ Groq URL error: ${urlError.message}`);
+    debug.push('🔄 Falling back to chunking method...');
+  }
+
+  // FALLBACK: Use chunking logic (existing code)
+  debug.push('📦 Starting chunked transcription...');
+  
+  // Get blob size for chunking
   const head = await fetch(blobUrl, { method: 'HEAD' });
   if (!head.ok) throw new Error(`Blob HEAD failed: ${head.status} ${head.statusText}`);
+  
   const totalBytes = Number(head.headers.get('content-length') || 0);
   if (!totalBytes) {
+    // If no content-length, download entire file and use direct upload
+    debug.push('📥 No content-length header, downloading entire file...');
     const fileRes = await fetch(blobUrl);
     if (!fileRes.ok) throw new Error(`Blob download failed: ${fileRes.status} ${fileRes.statusText}`);
     const arr = await fileRes.arrayBuffer();
-    return await groqOnce(Buffer.from(arr), filename);
+    return await groqDirectUpload(Buffer.from(arr), filename, debug);
   }
 
+  // Chunking logic
   let offset = 0;
   let chunkSize = Math.min(APP_CONFIG.MAX_CHUNK_BYTES, totalBytes);
   let part = 1;
@@ -288,7 +343,7 @@ async function transcribeWithGroqFromBlobChunked(blobUrl, filename, debug = []) 
     const buf = Buffer.from(await res.arrayBuffer());
 
     try {
-      const tr = await groqOnce(buf, `${filename}.part${part}.mp3`);
+      const tr = await groqDirectUpload(buf, `${filename}.part${part}.mp3`, debug);
       parts.push(tr.transcript);
       debug.push(`🧩 Groq OK for chunk ${part} (${buf.length} bytes)`);
       offset = end + 1;
@@ -296,21 +351,21 @@ async function transcribeWithGroqFromBlobChunked(blobUrl, filename, debug = []) 
     } catch (e) {
       const msg = String(e.message || e);
 
-      // Groq 413 → halve chunk and retry same offset
+      // Handle 413 errors by reducing chunk size
       if (/413/.test(msg) && chunkSize > APP_CONFIG.MIN_CHUNK_BYTES) {
         chunkSize = Math.max(APP_CONFIG.MIN_CHUNK_BYTES, Math.floor(chunkSize / 2));
         debug.push(`↘️ 413 from Groq, reducing chunk size to ~${Math.round(chunkSize / 1024 / 1024)}MB and retrying`);
         continue;
       }
 
-      // Groq 5xx → retry same chunk w/ backoff; if still failing, halve chunk and retry
+      // Handle 5xx errors with retries
       if (/(500|502|503|504)/.test(msg)) {
         let recovered = false;
         for (let i = 0; i < APP_CONFIG.GROQ_RETRY_COUNT; i++) {
           const delay = APP_CONFIG.GROQ_RETRY_BASE_DELAY_MS * Math.pow(1.6, i) + Math.floor(Math.random() * 200);
           await new Promise(r => setTimeout(r, delay));
           try {
-            const tr2 = await groqOnce(buf, `${filename}.part${part}.mp3`);
+            const tr2 = await groqDirectUpload(buf, `${filename}.part${part}.mp3`, debug);
             parts.push(tr2.transcript);
             debug.push(`🔁 Groq ${/5\d\d/.exec(msg)?.[0] || '5xx'} recovered on retry ${i + 1} for chunk ${part}`);
             offset = end + 1;
@@ -319,11 +374,10 @@ async function transcribeWithGroqFromBlobChunked(blobUrl, filename, debug = []) 
             break;
           } catch (e2) {
             if (i === APP_CONFIG.GROQ_RETRY_COUNT - 1) {
-              // last try: halve the chunk and reloop
               if (chunkSize > APP_CONFIG.MIN_CHUNK_BYTES) {
                 chunkSize = Math.max(APP_CONFIG.MIN_CHUNK_BYTES, Math.floor(chunkSize / 2));
                 debug.push(`🪓 Persistent 5xx. Halving chunk to ~${Math.round(chunkSize / 1024 / 1024)}MB and retrying`);
-                recovered = true; // let loop retry same offset
+                recovered = true;
               } else {
                 throw e2;
               }
@@ -351,28 +405,32 @@ async function transcribeWithGroqFromBlobChunked(blobUrl, filename, debug = []) 
       source: 'groq-chunked',
     },
   };
+}
 
-  async function groqOnce(fileBuffer, fname) {
-    const formData = new FormData();
-    formData.append('file', fileBuffer, { filename: fname, contentType: 'audio/mpeg' });
-    formData.append('model', APP_CONFIG.GROQ.MODEL);
-    formData.append('response_format', APP_CONFIG.GROQ.RESPONSE_FORMAT);
+// Helper function for direct file upload (same as your working MP3 path)
+async function groqDirectUpload(fileBuffer, filename, debug = []) {
+  const { default: fetch } = await import('node-fetch');
+  const groqApiKey = process.env.GROQ_API_KEY;
+  
+  const formData = new FormData();
+  formData.append('file', fileBuffer, { filename, contentType: 'audio/mpeg' });
+  formData.append('model', APP_CONFIG.GROQ.MODEL);
+  formData.append('response_format', APP_CONFIG.GROQ.RESPONSE_FORMAT);
 
-    const resp = await fetch(APP_CONFIG.GROQ.API_URL, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${groqApiKey}`, ...formData.getHeaders() },
-      body: formData,
-    });
+  const resp = await fetch(APP_CONFIG.GROQ.API_URL, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${groqApiKey}`, ...formData.getHeaders() },
+    body: formData,
+  });
 
-    if (!resp.ok) {
-      const errorText = await resp.text().catch(() => '');
-      throw new Error(`Groq API error: ${resp.status} ${errorText}`);
-    }
-
-    const text = await resp.text();
-    const dur = text.length / 8;
-    return { transcript: text, metrics: { durationSeconds: Math.round(dur) } };
+  if (!resp.ok) {
+    const errorText = await resp.text().catch(() => '');
+    throw new Error(`Groq API error: ${resp.status} ${errorText}`);
   }
+
+  const text = await resp.text();
+  const dur = text.length / 8;
+  return { transcript: text, metrics: { durationSeconds: Math.round(dur) } };
 }
 
 /* ---------- Enhanced TROOP (JSON-forced + distilled fallback) ---------- */
@@ -387,7 +445,7 @@ async function analyzeWithTROOP(transcript, episodeTitle = '', podcastTitle = ''
     'Arrays MUST contain exactly 3 items for tweetable_quotes, community_suggestions, cross_promo_matches.',
     'Each community_suggestions item MUST include first_post (<=220 chars).',
     'Each cross_promo_matches item MUST include outreach_dm (<=420 chars).',
-    'Maintain the episode’s tone/voice across title, description, captions, first_post, outreach_dm.'
+    'Maintain the episode's tone/voice across title, description, captions, first_post, outreach_dm.'
   ].join(' ');
 
   const enhancedTROOPPrompt = buildTroopPrompt(transcript, episodeTitle, podcastTitle);
@@ -489,7 +547,7 @@ Section 4: JSON Output Format 📋 CORE STRUCTURE
 Return only valid JSON (no prose). Do not include keys not listed below.
 
 {
-  "episode_summary": "2–3 sentences in the guest/show’s voice describing core promise and listener outcome.",
+  "episode_summary": "2–3 sentences in the guest/show's voice describing core promise and listener outcome.",
   "tweetable_quotes": ["Quote 1 with 1–2 hashtags", "Quote 2 with hashtags", "Quote 3 with hashtags"],
   "topics_keywords": [
     { "primary_intent": "Main searchable term", "semantic_neighbors": ["rel1","rel2","rel3","rel4","rel5"] },
@@ -519,7 +577,7 @@ Section 5: Business Objective
 **OBJECTIVE:** Help solo podcasters get more plays per episode with immediately actionable steps.
 
 Section 6: Perspective/Voice
-**PERSPECTIVE:** Supportive, clear, practical; match the episode’s tone/voice.
+**PERSPECTIVE:** Supportive, clear, practical; match the episode's tone/voice.
 
 Section 7: Methodology 🧠
 1) Transcript Foundation → 2) Semantic Expansion → 3) Conversation Insertion → 4) Niche Discovery
