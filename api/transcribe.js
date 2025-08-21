@@ -190,15 +190,42 @@ export default async function handler(req, res) {
       const searchTerm = extractSearchTerm(url);
       const searchResults = await searchListenNotes(searchTerm);
       
+      // FIXED: Proper episode resolution with RSS fallback
+      let episode;
+      let episodeSource = 'ListenNotes';
+      
       if (!searchResults.results?.length) {
-        return res.status(404).json({ 
-          error: 'No episodes found for this episode title',
-          search_term: searchTerm,
-          received_url: url
-        });
+        console.log('🔄 ListenNotes failed, trying RSS fallback...');
+        
+        try {
+          const rssEpisode = await getEpisodeFromRSS(url);
+          
+          // Use RSS episode data (format it like ListenNotes)
+          episode = {
+            title_original: rssEpisode.title_original,
+            description_original: rssEpisode.description_original,
+            audio: rssEpisode.audio,
+            audio_length_sec: rssEpisode.audio_length_sec,
+            podcast: rssEpisode.podcast
+          };
+          
+          episodeSource = 'RSS';
+          console.log(`✅ RSS fallback found episode: "${episode.title_original}"`);
+          
+        } catch (rssError) {
+          console.log('❌ RSS fallback also failed:', rssError.message);
+          return res.status(404).json({ 
+            error: 'No episodes found for this episode title',
+            search_term: searchTerm,
+            received_url: url,
+            attempted_sources: ['ListenNotes', 'RSS']
+          });
+        }
+      } else {
+        // ListenNotes worked, use normal episode data
+        episode = searchResults.results[0];
+        console.log(`✅ ListenNotes found episode: "${episode.title_original}"`);
       }
-
-      const episode = searchResults.results[0];
       
       if (!episode.audio) {
         return res.status(400).json({ 
@@ -254,12 +281,12 @@ export default async function handler(req, res) {
         duration: episode.audio_length_sec,
         audio_url: episode.audio,
         podcast_title: episode.podcast?.title_original || 'Unknown Podcast',
-        source: transcriptionSource === 'groq' ? 'ListenNotes + Groq' : 'ListenNotes + Whisper',
+        source: `${episodeSource} + ${transcriptionSource === 'groq' ? 'Groq' : 'Whisper'}`,
         transcription_source: transcriptionSource,
-        listennotes_id: episode.id,
+        listennotes_id: episode.id || null,
         received_url: url,
         search_term: searchTerm,
-        search_strategy: 'episode_title_search'
+        search_strategy: episodeSource === 'RSS' ? 'rss_fallback' : 'episode_title_search'
       };
       
       res.write(JSON.stringify(finalResponse) + '\n');
@@ -475,4 +502,107 @@ function extractKeywordsFromText(text) {
     .sort(([,a], [,b]) => b - a)
     .slice(0, 8)
     .map(([word]) => word);
+}
+
+/**
+ * Get episode from RSS feed when ListenNotes fails
+ */
+async function getEpisodeFromRSS(appleUrl) {
+  // Extract podcast ID from Apple URL
+  const podcastId = appleUrl.match(/id(\d+)/)?.[1];
+  if (!podcastId) {
+    throw new Error('Could not extract podcast ID from Apple URL');
+  }
+
+  console.log('📡 Getting RSS feed from iTunes API...');
+  
+  // Get RSS feed URL from iTunes API
+  const itunesResponse = await fetch(`https://itunes.apple.com/lookup?id=${podcastId}&entity=podcast`);
+  const itunesData = await itunesResponse.json();
+  const rssUrl = itunesData.results?.[0]?.feedUrl;
+  
+  if (!rssUrl) {
+    throw new Error('No RSS feed found for this podcast');
+  }
+
+  console.log('📄 Fetching RSS feed:', rssUrl);
+  
+  // Get RSS feed content
+  const rssResponse = await fetch(rssUrl);
+  const rssXML = await rssResponse.text();
+  
+  // Extract episode title from Apple URL for matching
+  const episodeTitle = extractSearchTerm(appleUrl);
+  
+  console.log('🔍 Looking for episode matching:', episodeTitle);
+  
+  // Find episode in RSS by title matching
+  const episodeMatch = findEpisodeInRSS(rssXML, episodeTitle);
+  
+  if (!episodeMatch) {
+    throw new Error('Episode not found in RSS feed');
+  }
+
+  console.log('✅ Found episode in RSS feed');
+  
+  return episodeMatch;
+}
+
+/**
+ * Simple RSS parsing to find episode
+ */
+function findEpisodeInRSS(rssXML, searchTitle) {
+  // Look for the episode title in the RSS
+  const titleRegex = new RegExp(searchTitle.replace(/\s+/g, '.*'), 'i');
+  
+  // Find all <item> sections (episodes)
+  const items = rssXML.split('<item>');
+  
+  for (let i = 1; i < items.length; i++) {
+    const item = items[i];
+    
+    // Extract title
+    const titleMatch = item.match(/<title[^>]*>(.*?)<\/title>/s);
+    const title = titleMatch ? titleMatch[1].replace(/<!\[CDATA\[(.*?)\]\]>/s, '$1').trim() : '';
+    
+    // Check if this episode matches our search
+    if (titleRegex.test(title)) {
+      // Extract audio URL from enclosure
+      const enclosureMatch = item.match(/<enclosure[^>]+url="([^"]+)"/);
+      const audioUrl = enclosureMatch ? enclosureMatch[1] : null;
+      
+      if (!audioUrl) continue;
+      
+      // Extract description
+      const descMatch = item.match(/<description[^>]*>(.*?)<\/description>/s);
+      const description = descMatch ? descMatch[1].replace(/<!\[CDATA\[(.*?)\]\]>/s, '$1').trim() : '';
+      
+      // Extract duration if available
+      const durationMatch = item.match(/<itunes:duration[^>]*>([^<]+)</);
+      const duration = durationMatch ? parseDuration(durationMatch[1]) : 0;
+      
+      return {
+        title_original: title,
+        description_original: description,
+        audio: audioUrl,
+        audio_length_sec: duration,
+        podcast: { title_original: 'RSS Podcast' }
+      };
+    }
+  }
+  
+  return null;
+}
+
+/**
+ * Parse duration from iTunes format (HH:MM:SS or MM:SS)
+ */
+function parseDuration(durationStr) {
+  const parts = durationStr.split(':').map(p => parseInt(p) || 0);
+  if (parts.length === 3) {
+    return parts[0] * 3600 + parts[1] * 60 + parts[2]; // HH:MM:SS
+  } else if (parts.length === 2) {
+    return parts[0] * 60 + parts[1]; // MM:SS
+  }
+  return 0;
 }
