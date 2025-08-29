@@ -12,7 +12,7 @@ const CONFIG = {
   },
   GROQ: {
     API_URL: 'https://api.groq.com/openai/v1/audio/transcriptions',
-    MODEL: 'distil-whisper-large-v3-en', // $0.02/hour, 240x real-time speed
+    MODEL: 'whisper-large-v3-turbo', // current model, 240x real-time speed
     MAX_FILE_SIZE: 25 * 1024 * 1024, // 25MB limit
     RESPONSE_FORMAT: 'text'
   },
