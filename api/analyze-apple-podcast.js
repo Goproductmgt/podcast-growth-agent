@@ -24,6 +24,8 @@ const APP_CONFIG = {
   HARD_SIZE_LIMIT_BYTES: 1024 * 1024 * 300, // 300MB
   FETCH_TIMEOUT_MS: 60_000,
   MAX_RETRIES: 2,
+  DOWNLOAD_TIMEOUT_MS: 180_000, // 3 minutes for audio download
+
 };
 
 export default async function handler(req, res) {
@@ -69,7 +71,7 @@ export default async function handler(req, res) {
     }
 
     debug.push('📥 Downloading MP3 → /tmp (stream) with retries…');
-    const tmpInfo = await downloadToTmpWithRetries(audioUrl, APP_CONFIG.MAX_RETRIES, APP_CONFIG.FETCH_TIMEOUT_MS);
+    const tmpInfo = await downloadToTmpWithRetries(audioUrl, APP_CONFIG.MAX_RETRIES, APP_CONFIG.DOWNLOAD_TIMEOUT_MS);
     debug.push(`📁 Saved to /tmp (${Math.round(tmpInfo.sizeBytes / 1024 / 1024)}MB)`);
 
     const fileExt = guessExtension(contentType) || '.mp3';
