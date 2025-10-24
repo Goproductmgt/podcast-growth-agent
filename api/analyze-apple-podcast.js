@@ -359,7 +359,7 @@ async function analyzeWithTROOP(transcript, episodeTitle = '', podcastTitle = ''
         response_format: { type: 'json_object' },
         // (2) remove temperature, increase tokens
         // temperature: 0.75,
-        max_tokens: 4500,
+        max_completion_tokens: 4500,
         messages: [{ role: 'system', content: baseSystem }, { role: 'user', content: prompt }],
       }),
       signal: AbortSignal.timeout(90_000),
@@ -530,7 +530,7 @@ async function distillTranscript(transcript, openaiApiKey, baseSystem) {
       response_format: { type: 'json_object' },
       // (3) remove temperature here too
       // temperature: 0.5,
-      max_tokens: 1200,
+      max_completion_tokens: 1200,
       messages: [{ role: 'system', content: baseSystem }, { role: 'user', content: prompt }],
     }),
     signal: AbortSignal.timeout(60_000),
