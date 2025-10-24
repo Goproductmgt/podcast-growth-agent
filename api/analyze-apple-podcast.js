@@ -18,7 +18,7 @@ const APP_CONFIG = {
   },
   OPENAI: {
     CHAT_URL: 'https://api.openai.com/v1/chat/completions',
-    ANALYSIS_MODEL: 'gpt-40',
+    ANALYSIS_MODEL: 'gpt-4o',
   },
   HARD_SIZE_LIMIT_BYTES: 1024 * 1024 * 300, // 300MB
   FETCH_TIMEOUT_MS: 60_000,
